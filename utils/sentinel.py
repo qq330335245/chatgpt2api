@@ -1,22 +1,26 @@
-"""OpenAI Sentinel Token (PoW) 生成与请求工具函数。
+"""OpenAI Sentinel Token (PoW) ??????????
 
-用于密码登录、注册等需要 sentinel token 的流程。
+???????????? sentinel token ????
 """
 from __future__ import annotations
 
 import base64
 import json
+import os
 import random
+import shutil
+import subprocess
 import time
 import uuid
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from curl_cffi.requests import Session
 
 
 class SentinelTokenGenerator:
-    """Sentinel Token 生成器（PoW - Proof of Work）。"""
+    """Sentinel Token ????PoW - Proof of Work??"""
     MAX_ATTEMPTS = 500_000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
@@ -84,7 +88,7 @@ class SentinelTokenGenerator:
         return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
-# ── 默认 User-Agent 和 sec-ch-ua ──────────────────────────────
+# ?? ?? User-Agent ? sec-ch-ua ??????????????????????????????
 DEFAULT_SENTINEL_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -92,8 +96,129 @@ DEFAULT_SENTINEL_USER_AGENT = (
 )
 DEFAULT_SENTINEL_SEC_CH_UA = '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"'
 
+_FLOW_PAGE_URLS = {
+    "oauth_create_account": "https://auth.openai.com/about-you",
+    "username_password_create": "https://auth.openai.com/create-account/password",
+    "password_verify": "https://auth.openai.com/log-in/password",
+    "authorize_continue": "https://auth.openai.com/",
+}
 
-def build_sentinel_token(
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _node_probe_script() -> Path:
+    override = str(os.environ.get("SENTINEL_NODE_PROBE") or "").strip()
+    if override:
+        return Path(override)
+    return _project_root() / "scripts" / "sentinel_node_probe.js"
+
+
+def _node_binary() -> str:
+    override = str(os.environ.get("SENTINEL_NODE_PATH") or "").strip()
+    if override:
+        return override
+    return shutil.which("node") or "node"
+
+
+def _truthy_env(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _page_url_for_flow(flow: str, page_url: str = "") -> str:
+    explicit = str(page_url or "").strip()
+    if explicit:
+        return explicit
+    return _FLOW_PAGE_URLS.get(str(flow or "").strip(), "")
+
+
+def _oai_sc_from_token_payload(payload: dict[str, Any]) -> str:
+    c_value = str(payload.get("c") or "").strip()
+    return f"0{c_value}" if c_value else ""
+
+
+def _validate_node_token_payload(payload: dict[str, Any], flow: str) -> None:
+    if payload.get("e"):
+        raise RuntimeError(f"sentinel_node_token_error_{str(payload.get('e') or '')[:120]}")
+    missing = [key for key in ("p", "t", "c", "id", "flow") if not str(payload.get(key) or "").strip()]
+    if missing:
+        raise RuntimeError(f"sentinel_node_token_missing_{','.join(missing)}")
+    token_flow = str(payload.get("flow") or "").strip()
+    if token_flow and flow and token_flow != flow:
+        raise RuntimeError(f"sentinel_node_token_flow_mismatch_{token_flow}")
+
+
+def build_sentinel_token_via_node(
+    device_id: str,
+    flow: str,
+    *,
+    user_agent: str = "",
+    page_url: str = "",
+    timeout_seconds: int = 70,
+) -> tuple[str, str]:
+    """???? Sentinel SDK?Node ????????? t ??? token?"""
+    script = _node_probe_script()
+    if not script.exists():
+        raise FileNotFoundError(f"missing sentinel node probe: {script}")
+
+    command = [
+        _node_binary(),
+        str(script),
+        "--flow",
+        str(flow or "").strip(),
+        "--device-id",
+        str(device_id or "").strip(),
+        "--full",
+    ]
+    resolved_page_url = _page_url_for_flow(flow, page_url)
+    if resolved_page_url:
+        command.extend(["--page-url", resolved_page_url])
+    if user_agent:
+        command.extend(["--user-agent", user_agent])
+
+    completed = subprocess.run(
+        command,
+        cwd=str(_project_root()),
+        text=True,
+        capture_output=True,
+        timeout=max(5, int(timeout_seconds or 70)),
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"sentinel_node_probe_failed_{completed.returncode}: {detail[:300]}")
+
+    raw = str(completed.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"sentinel_node_probe_invalid_json: {raw[:200]}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("sentinel_node_probe_invalid_payload")
+
+    # ???? --bundle-output ?? {token: "..."} ????
+    if "token" in payload and not payload.get("p"):
+        token_raw = str(payload.get("token") or "").strip()
+        payload = json.loads(token_raw)
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("sentinel_node_probe_invalid_token_object")
+
+    _validate_node_token_payload(payload, flow)
+    if not str(payload.get("id") or "").strip():
+        payload["id"] = device_id
+    if not str(payload.get("flow") or "").strip():
+        payload["flow"] = flow
+
+    sentinel_value = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return sentinel_value, _oai_sc_from_token_payload(payload)
+
+
+def build_sentinel_token_python(
     session: "Session",
     device_id: str,
     flow: str,
@@ -101,21 +226,7 @@ def build_sentinel_token(
     user_agent: str = "",
     sec_ch_ua: str = "",
 ) -> tuple[str, str]:
-    """请求 sentinel token 并返回 (sentinel_header_value, oai_sc_cookie_value)。
-
-    Args:
-        session: curl_cffi Session 实例
-        device_id: 设备 ID
-        flow: 流程标识（如 "password_verify", "username_password_create" 等）
-        user_agent: 可选的 User-Agent 覆盖
-        sec_ch_ua: 可选的 sec-ch-ua 覆盖
-
-    Returns:
-        (openai-sentinel-token header value, oai-sc cookie value) 元组
-
-    Raises:
-        RuntimeError: sentinel 请求失败
-    """
+    """? Python ???????? p/c?t ?????"""
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     generator = SentinelTokenGenerator(device_id, ua)
@@ -157,3 +268,55 @@ def build_sentinel_token(
     # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
     oai_sc_value = "0" + token
     return sentinel_value, oai_sc_value
+
+
+def build_sentinel_token(
+    session: "Session",
+    device_id: str,
+    flow: str,
+    *,
+    user_agent: str = "",
+    sec_ch_ua: str = "",
+    page_url: str = "",
+    prefer_node: bool | None = None,
+) -> tuple[str, str]:
+    """?? sentinel token ??? (sentinel_header_value, oai_sc_cookie_value)?
+
+    ????? Node SDK ??????? t???????? Python ?????
+
+    Args:
+        session: curl_cffi Session ??
+        device_id: ?? ID
+        flow: ?????? "password_verify", "username_password_create" ??
+        user_agent: ??? User-Agent ??
+        sec_ch_ua: ??? sec-ch-ua ??
+        page_url: ?????????? Node SDK ??
+        prefer_node: ???? Node????? SENTINEL_USE_NODE??????
+
+    Returns:
+        (openai-sentinel-token header value, oai-sc cookie value) ??
+
+    Raises:
+        RuntimeError: sentinel ????
+    """
+    use_node = _truthy_env("SENTINEL_USE_NODE", True) if prefer_node is None else bool(prefer_node)
+    if use_node:
+        try:
+            return build_sentinel_token_via_node(
+                device_id,
+                flow,
+                user_agent=user_agent or DEFAULT_SENTINEL_USER_AGENT,
+                page_url=page_url,
+            )
+        except Exception:
+            # ?????????????? prefer_node=True ?????
+            if prefer_node is True:
+                raise
+
+    return build_sentinel_token_python(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+    )
