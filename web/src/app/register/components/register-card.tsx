@@ -50,7 +50,7 @@ export function RegisterCard() {
       type,
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
-      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [] } : {}),
+      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [], inbox_address: "", cf_inbox_jwt: "" } : {}),
       ...(type === "tempmail_lol" ? { api_key: "", domain: [] } : {}),
       ...(type === "moemail" ? { api_base: "", api_key: "", domain: [] } : {}),
       ...(type === "inbucket" ? { api_base: "", domain: [], random_subdomain: true } : {}),
@@ -221,6 +221,39 @@ export function RegisterCard() {
                               <label className="text-sm text-stone-700">Admin Password</label>
                               <Input value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                             </div>
+                          ) : null}
+                          {type === "cloudflare_temp_email" ? (
+                            <>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">代收邮箱 inbox_address（可选）</label>
+                                <Input
+                                  value={String(provider.inbox_address || "")}
+                                  onChange={(event) => updateProvider(index, { inbox_address: event.target.value })}
+                                  className="h-10 rounded-xl border-stone-200 bg-white"
+                                  disabled={config.enabled}
+                                  placeholder="CF 实际收件箱，如 catch@your-cf-domain.com"
+                                />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">CF Inbox JWT（可选）</label>
+                                <Input
+                                  value={String(provider.cf_inbox_jwt || "")}
+                                  onChange={(event) => updateProvider(index, { cf_inbox_jwt: event.target.value })}
+                                  className="h-10 rounded-xl border-stone-200 bg-white"
+                                  disabled={config.enabled}
+                                  placeholder="固定代收箱 JWT；不填则用 admin 查 inbox_address"
+                                />
+                              </div>
+                              <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
+                                <p className="mb-1 font-medium">代收/转发说明（对齐 codex-console）</p>
+                                <ol className="list-inside list-decimal space-y-0.5">
+                                  <li>OpenAI 登录邮箱是原别名（如 iCloud Hide My Email）</li>
+                                  <li>邮件实际落到 CF 代收箱时，填写上方 inbox_address / JWT</li>
+                                  <li>续期时：JWT 开代收箱，再按账号 email 过滤验证码邮件</li>
+                                  <li>也可在账号上设 mail_inbox 覆盖单号代收地址</li>
+                                </ol>
+                              </div>
+                            </>
                           ) : null}
                         </>
                       ) : null}

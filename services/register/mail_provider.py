@@ -327,12 +327,42 @@ def _extract_text_candidates(value: Any) -> list[str]:
 
 
 def _message_matches_email(data: dict[str, Any], email: str) -> bool:
+    """判断邮件是否属于目标地址。
+
+    代收场景（iCloud Hide My Email 等转发到 CF 统一收件箱）下，
+    CF 的 to 可能是 catch-all，原别名常出现在 raw/正文/自定义字段中。
+    """
     target = str(email or "").strip().lower()
+    if not target:
+        return True
     candidates: list[str] = []
-    for key in ("to", "toEmail", "mailTo", "receiver", "receivers", "address", "email", "envelope_to"):
+    for key in ("to", "toEmail", "mailTo", "receiver", "receivers", "address", "email", "envelope_to", "target", "recipient", "original_to"):
         if key in data:
             candidates.extend(_extract_text_candidates(data.get(key)))
-    return not target or not candidates or any(target in str(item).strip().lower() for item in candidates if str(item).strip())
+    if any(target in str(item).strip().lower() for item in candidates if str(item).strip()):
+        return True
+    # 无收件人字段时不拦截（兼容部分接口只回列表摘要）
+    if not candidates:
+        blob_parts = [
+            str(data.get("subject") or ""),
+            str(data.get("text") or data.get("text_content") or ""),
+            str(data.get("html") or data.get("html_content") or ""),
+            str(data.get("raw") or data.get("source") or ""),
+        ]
+        blob = "\n".join(blob_parts).lower()
+        if target in blob:
+            return True
+        # 无任何线索时放行，交由调用方按时间窗/验证码再筛
+        return True
+    # 有 to 字段但不匹配：仍检查 raw/正文是否含原别名（转发信常见）
+    blob_parts = [
+        str(data.get("subject") or ""),
+        str(data.get("text") or data.get("text_content") or ""),
+        str(data.get("html") or data.get("html_content") or ""),
+        str(data.get("raw") or data.get("source") or ""),
+    ]
+    blob = "\n".join(blob_parts).lower()
+    return target in blob
 
 
 def _extract_code(message: dict[str, Any]) -> str | None:
@@ -426,6 +456,15 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
+        # 代收箱：原邮箱（如 iCloud 别名）转发到此 CF 地址时使用
+        self.inbox_address = str(
+            entry.get("inbox_address")
+            or entry.get("catch_all_address")
+            or entry.get("cf_inbox")
+            or entry.get("temp_mail_target_email")
+            or ""
+        ).strip()
+        self.cf_inbox_jwt = str(entry.get("cf_inbox_jwt") or "").strip()
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
@@ -434,35 +473,251 @@ class CloudflareTempMailProvider(BaseMailProvider):
             raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
 
+    def _resolve_address_jwt(self, address: str) -> tuple[str, str]:
+        """部分旧版 Worker 支持；新版可能没有 /admin/get_address。"""
+        data = self._request(
+            "POST",
+            "/admin/get_address",
+            headers={"x-admin-auth": self.admin_password},
+            payload={"address": address},
+        )
+        resolved = str(data.get("address") or address or "").strip()
+        token = str(data.get("jwt") or "").strip()
+        if not resolved or not token:
+            raise RuntimeError(f"CloudflareTempMail 无法获取邮箱 {address} 的 JWT")
+        return resolved, token
+
+    def _admin_list_mails(self, address: str = "", limit: int = 30) -> list[dict[str, Any]]:
+        """用 admin_password 直接拉邮件列表（无需 Address JWT）。
+
+        对齐 cloudflare_temp_email: GET /admin/mails?address=&limit=&offset=
+        以及 codex-console 的 admin 读信回退。
+        """
+        if not self.admin_password:
+            raise RuntimeError("CloudflareTempMail 缺少 admin_password，无法走 /admin/mails")
+        limits: list[int] = []
+        for value in (limit, 50, 40, 30, 20, 10, 5):
+            number = max(1, int(value or 30))
+            if number not in limits:
+                limits.append(number)
+        last_error = ""
+        for limit_value in limits:
+            params: dict[str, Any] = {"limit": limit_value, "offset": 0}
+            if address:
+                params["address"] = address
+            try:
+                data = self._request(
+                    "GET",
+                    "/admin/mails",
+                    headers={"x-admin-auth": self.admin_password},
+                    params=params,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                # 不同部署对 limit 校验不一，降级重试
+                if "invalid limit" in last_error.lower() or "400" in last_error:
+                    continue
+                raise
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+            if isinstance(data, dict):
+                for key in ("results", "mails", "data", "items", "list"):
+                    value = data.get(key)
+                    if isinstance(value, list):
+                        return [item for item in value if isinstance(item, dict)]
+            return []
+        raise RuntimeError(last_error or "CloudflareTempMail /admin/mails 请求失败")
+
+    def _mailbox_from_admin(self, alias: str, inbox_address: str) -> dict[str, Any]:
+        inbox = str(inbox_address or alias or "").strip()
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": alias,
+            "filter_email": alias,
+            # token 占位：模块层要求非空；真正读信走 admin
+            "token": "admin",
+            "auth_mode": "admin",
+            "inbox_address": inbox,
+        }
+
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
         address = str(data.get("address") or "").strip()
         token = str(data.get("jwt") or "").strip()
         if not address or not token:
             raise RuntimeError("CloudflareTempMail 缺少 address 或 jwt")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token, "filter_email": address, "auth_mode": "jwt", "inbox_address": address}
 
-    def get_existing_mailbox(self, email: str) -> dict[str, Any]:
-        """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
-        data = self._request("POST", "/admin/get_address", headers={"x-admin-auth": self.admin_password}, payload={"address": email})
-        address = str(data.get("address") or "").strip()
-        token = str(data.get("jwt") or "").strip()
-        if not address or not token:
-            raise RuntimeError(f"CloudflareTempMail 无法获取已有邮箱 {email} 的 JWT")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+    def get_existing_mailbox(self, email: str, receive_email: str = "") -> dict[str, Any]:
+        """获取读信凭据。
 
-    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
-        data = self._request("GET", "/api/mails", headers={"Authorization": f"Bearer {mailbox['token']}"}, params={"limit": 10, "offset": 0})
-        raw = list(data.get("results") or []) if isinstance(data, dict) else data if isinstance(data, list) else []
-        messages = [item for item in raw if isinstance(item, dict) and _message_matches_email(item, str(mailbox.get("address") or ""))]
-        if not messages:
-            return None
-        item = messages[0]
+        - email: OpenAI 登录用的原地址/别名（用于过滤邮件）
+        - receive_email: 实际 CF 收件箱；空则先尝试 email 自身，再回退 provider.inbox_address
+        优先 JWT；JWT 不可用时用 admin_password + /admin/mails 读代收箱（无需 cf_inbox_jwt）。
+        """
+        alias = str(email or "").strip()
+        if not alias:
+            raise RuntimeError("CloudflareTempMail 邮箱地址不能为空")
+        prefer_inbox = str(receive_email or self.inbox_address or "").strip()
+        alias_is_forward = bool(prefer_inbox) and prefer_inbox.lower() != alias.lower()
+
+        # 0) 转发/代收：优先 admin/JWT，避免对 iCloud 别名无效 get_address
+        if alias_is_forward:
+            if self.cf_inbox_jwt:
+                return {
+                    "provider": self.name,
+                    "provider_ref": self.provider_ref,
+                    "address": alias,
+                    "filter_email": alias,
+                    "token": self.cf_inbox_jwt,
+                    "auth_mode": "jwt",
+                    "inbox_address": prefer_inbox,
+                }
+            if self.admin_password:
+                return self._mailbox_from_admin(alias, prefer_inbox)
+
+        # 1) 原地址当 CF 本地邮箱（旧接口 get_address，部分部署已移除）
+        try:
+            address, token = self._resolve_address_jwt(alias)
+            return {
+                "provider": self.name,
+                "provider_ref": self.provider_ref,
+                "address": address,
+                "filter_email": alias,
+                "token": token,
+                "auth_mode": "jwt",
+                "inbox_address": address,
+            }
+        except Exception:
+            pass
+
+        # 2) 固定 JWT 代收箱
+        if self.cf_inbox_jwt:
+            return {
+                "provider": self.name,
+                "provider_ref": self.provider_ref,
+                "address": alias,
+                "filter_email": alias,
+                "token": self.cf_inbox_jwt,
+                "auth_mode": "jwt",
+                "inbox_address": prefer_inbox or alias,
+            }
+
+        # 3) 代收地址 get_address 换 JWT
+        if prefer_inbox and prefer_inbox.lower() != alias.lower():
+            try:
+                inbox_address, token = self._resolve_address_jwt(prefer_inbox)
+                return {
+                    "provider": self.name,
+                    "provider_ref": self.provider_ref,
+                    "address": alias,
+                    "filter_email": alias,
+                    "token": token,
+                    "auth_mode": "jwt",
+                    "inbox_address": inbox_address,
+                }
+            except Exception:
+                pass
+
+        # 4) admin 直读
+        if self.admin_password:
+            return self._mailbox_from_admin(alias, prefer_inbox or alias)
+
+        raise RuntimeError(
+            f"CloudflareTempMail 无法为 {alias} 建立读信会话；"
+            "请配置 admin_password（走 /admin/mails）或 cf_inbox_jwt"
+        )
+
+    def _message_from_item(self, item: dict[str, Any], filter_email: str, mailbox: dict[str, Any]) -> dict[str, Any]:
         text_content, html_content = _extract_content(item)
-        sender = item.get("from") or item.get("sender") or ""
+        # admin raw_mails 常只有 raw 字段
+        if not text_content and not html_content:
+            raw = str(item.get("raw") or "")
+            if raw:
+                text_content = raw
+        sender = item.get("from") or item.get("source") or item.get("sender") or ""
         if isinstance(sender, dict):
             sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
-        return {"provider": self.name, "mailbox": mailbox["address"], "message_id": str(item.get("id") or item.get("_id") or ""), "subject": str(item.get("subject") or ""), "sender": str(sender), "text_content": text_content, "html_content": html_content, "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")), "raw": item}
+        return {
+            "provider": self.name,
+            "mailbox": filter_email or str(mailbox.get("address") or ""),
+            "message_id": str(item.get("id") or item.get("_id") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": str(sender),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(
+                item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")
+            ),
+            "raw": item,
+        }
+
+    def _pick_matching_mail(self, items: list[dict[str, Any]], filter_email: str, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        """优先匹配登录别名；其次匹配 CF 代收箱地址（转发信 to 常是 catch-all）。"""
+        inbox = str(mailbox.get("inbox_address") or "").strip()
+        # 1) 登录别名精确命中
+        if filter_email:
+            for item in items:
+                if isinstance(item, dict) and _message_matches_email(item, filter_email):
+                    return self._message_from_item(item, filter_email, mailbox)
+        # 2) 代收箱命中（iCloud Hide My Email 转发后 address 多为 inbox）
+        if inbox:
+            for item in items:
+                if isinstance(item, dict) and _message_matches_email(item, inbox):
+                    return self._message_from_item(item, filter_email or inbox, mailbox)
+        # 3) 已按 address=inbox 拉列表时，列表本身即该箱邮件，取第一封可用
+        if items and (not filter_email or (inbox and filter_email.lower() != inbox.lower())):
+            for item in items:
+                if isinstance(item, dict):
+                    return self._message_from_item(item, filter_email or inbox, mailbox)
+        return None
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        filter_email = str(mailbox.get("filter_email") or mailbox.get("address") or "").strip()
+        inbox_address = str(mailbox.get("inbox_address") or mailbox.get("address") or filter_email).strip()
+        auth_mode = str(mailbox.get("auth_mode") or "").strip().lower()
+        token = str(mailbox.get("token") or "").strip()
+
+        # A) JWT 用户邮箱接口
+        if auth_mode != "admin" and token and token != "admin" and "." in token:
+            try:
+                data = self._request(
+                    "GET",
+                    "/api/mails",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"limit": 30, "offset": 0},
+                )
+                raw = list(data.get("results") or []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                hit = self._pick_matching_mail([item for item in raw if isinstance(item, dict)], filter_email, mailbox)
+                if hit:
+                    return hit
+            except Exception:
+                pass
+
+        # B) admin 直读指定收件地址（apple2@...）
+        if self.admin_password:
+            last_error = ""
+            for address in dict.fromkeys([inbox_address, filter_email, ""]):
+                try:
+                    items = self._admin_list_mails(address=address, limit=30)
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+                # address 过滤可能把转发信漏掉：先按 alias 匹配，再按 inbox
+                hit = self._pick_matching_mail(items, filter_email, mailbox)
+                if hit:
+                    return hit
+                if filter_email and filter_email.lower() != inbox_address.lower():
+                    hit = self._pick_matching_mail(items, inbox_address, mailbox)
+                    if hit:
+                        # 仍挂到 alias 上，方便日志
+                        hit["mailbox"] = filter_email
+                        return hit
+            if last_error and auth_mode == "admin":
+                raise RuntimeError(last_error)
+
+        return None
 
     def close(self) -> None:
         self.session.close()
@@ -553,6 +808,24 @@ class DDGMailProvider(BaseMailProvider):
             return str(parsed.get("To") or "").strip().lower()
         except Exception:
             return ""
+
+    def get_existing_mailbox(self, email: str, receive_email: str = "") -> dict[str, Any]:
+        """复用固定 CF 收件箱 JWT，按目标地址过滤转发到该收件箱的 DDG 邮件。"""
+        _ = receive_email
+        address = str(email or "").strip()
+        if not address:
+            raise RuntimeError("DDGMail 邮箱地址不能为空")
+        if not self.cf_inbox_jwt:
+            raise RuntimeError("DDGMail 需要 cf_inbox_jwt（DDG 转发目标的固定收件箱 JWT）")
+        if not self.cf_api_base:
+            raise RuntimeError("DDGMail 需要 api_base/cf_api_base")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "token": self.cf_inbox_jwt,
+            "label": self.label,
+        }
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         target_address = str(mailbox.get("address") or "").strip().lower()
@@ -1545,27 +1818,103 @@ def release_mailbox(mailbox: dict) -> None:
     _release_outlook_token_state(str(mailbox.get("address") or ""))
 
 
-def get_existing_mailbox(mail_config: dict, email: str) -> dict:
-    """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
-    enabled = _enabled_entries(mail_config)
-    tried: set[str] = set()
+DEFAULT_EXISTING_MAILBOX_PROVIDER_TYPE = "cloudflare_temp_email"
+
+
+def list_mail_provider_options(mail_config: dict) -> list[dict]:
+    """供 UI/账号绑定使用的邮箱服务列表。"""
+    options: list[dict] = []
+    for entry in _entries(mail_config):
+        options.append({
+            "provider_ref": str(entry.get("provider_ref") or ""),
+            "type": str(entry.get("type") or ""),
+            "label": str(entry.get("label") or entry.get("provider_ref") or entry.get("type") or ""),
+            "enable": bool(entry.get("enable")),
+        })
+    return options
+
+
+def get_existing_mailbox(
+    mail_config: dict,
+    email: str,
+    receive_email: str = "",
+    provider_ref: str = "",
+    provider_type: str = "",
+) -> dict:
+    """通过已配置邮箱服务查询已有地址，用于登录 OTP 收信。
+
+    email: 登录别名/原邮箱（过滤用）
+    receive_email: 实际收件箱（代收场景）
+    provider_ref: 账号绑定的服务引用（如 cloudflare_temp_email#1），优先且只走该服务
+    provider_type: 未绑 ref 时按类型过滤；都空则默认 cloudflare_temp_email
+    """
+    target = str(email or "").strip()
+    if not target:
+        raise RuntimeError("邮箱地址不能为空")
+    receive = str(receive_email or "").strip()
+    ref = str(provider_ref or "").strip()
+    ptype = str(provider_type or "").strip()
+
+    all_entries = _entries(mail_config)
+    if not all_entries:
+        raise RuntimeError("未配置 mail.providers，请先在注册设置中配置邮箱服务")
+
+    candidates: list[dict] = []
+    if ref:
+        candidates = [item for item in all_entries if str(item.get("provider_ref") or "") == ref]
+        if not candidates:
+            raise RuntimeError(f"账号绑定的邮箱服务不存在: {ref}")
+    else:
+        # 未绑 ref：显式 type 优先；否则默认 Cloudflare Temp Mail，免逐账号配置
+        if not ptype:
+            ptype = DEFAULT_EXISTING_MAILBOX_PROVIDER_TYPE
+        candidates = [item for item in all_entries if str(item.get("type") or "") == ptype]
+        if not candidates and ptype == DEFAULT_EXISTING_MAILBOX_PROVIDER_TYPE:
+            # 未配置 CF 时退回已启用列表，避免完全不可用
+            candidates = [item for item in all_entries if item.get("enable")]
+            if not candidates:
+                raise RuntimeError(
+                    "mail.providers 未配置 cloudflare_temp_email，也没有其它启用的邮箱服务"
+                )
+        elif not candidates:
+            raise RuntimeError(f"未找到类型为 {ptype} 的邮箱服务")
+        # 同类型优先 enable 的
+        candidates = sorted(candidates, key=lambda item: (0 if item.get("enable") else 1))
+
     last_error = ""
-    for _ in range(len(enabled)):
-        provider = _create_provider(mail_config)
-        provider_key = f"{provider.name}#{provider.provider_ref}"
+    for entry in candidates:
+        provider = _create_provider(
+            mail_config,
+            str(entry.get("type") or ""),
+            str(entry.get("provider_ref") or ""),
+        )
         try:
-            if provider_key in tried:
+            if not hasattr(provider, "get_existing_mailbox"):
+                last_error = f"邮箱提供商 {provider.name} 不支持查询已有邮箱"
+                if ref:
+                    raise RuntimeError(last_error)
                 continue
-            tried.add(provider_key)
-            if hasattr(provider, "get_existing_mailbox"):
-                mailbox = provider.get_existing_mailbox(email)
-                return mailbox
-            else:
-                raise RuntimeError(f"邮箱提供商 {provider.name} 不支持查询已有邮箱")
-        except RuntimeError as error:
+            try:
+                mailbox = provider.get_existing_mailbox(target, receive_email=receive)
+            except TypeError:
+                mailbox = provider.get_existing_mailbox(target)
+            if not isinstance(mailbox, dict) or not (
+                mailbox.get("token") or str(mailbox.get("auth_mode") or "").strip().lower() == "admin"
+            ):
+                last_error = f"邮箱提供商 {provider.name} 未返回可用 mailbox"
+                if ref:
+                    raise RuntimeError(last_error)
+                continue
+            mailbox.setdefault("filter_email", target)
+            mailbox.setdefault("provider_ref", str(entry.get("provider_ref") or ""))
+            mailbox.setdefault("provider", str(entry.get("type") or provider.name))
+            mailbox.setdefault("_code_not_before", datetime.now(timezone.utc))
+            return mailbox
+        except Exception as error:
             last_error = str(error)
-            if "DDG日上限已达" not in last_error:
-                raise
+            if ref:
+                raise RuntimeError(f"绑定邮箱服务 {ref} 读信失败: {last_error}") from error
+            continue
         finally:
             provider.close()
-    raise RuntimeError(last_error or "所有启用的邮箱提供商均无法查询已有邮箱")
+    raise RuntimeError(last_error or "所有候选邮箱提供商均无法查询已有邮箱")

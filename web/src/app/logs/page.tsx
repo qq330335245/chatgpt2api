@@ -139,6 +139,7 @@ function LogsContent() {
         <div className="space-y-1">
           <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Logs</div>
           <h1 className="text-2xl font-semibold tracking-tight">日志管理</h1>
+          <p className="text-sm text-stone-500">续期结果在「账号管理日志」：成功会显示 expires_at_text，失败显示 error。</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Select value={type} onValueChange={setType}>
@@ -199,6 +200,9 @@ function LogsContent() {
                   {isCallLog ? <TableHead>调用耗时</TableHead> : null}
                   {isCallLog ? <TableHead>状态</TableHead> : null}
                   {isCallLog ? <TableHead className="w-36">图片</TableHead> : null}
+                  {!isCallLog ? <TableHead>邮箱</TableHead> : null}
+                  {!isCallLog ? <TableHead>结果</TableHead> : null}
+                  {!isCallLog ? <TableHead>过期/错误</TableHead> : null}
                   <TableHead>简述</TableHead>
                   <TableHead className="w-40">操作</TableHead>
                 </TableRow>
@@ -245,6 +249,33 @@ function LogsContent() {
                               -
                             </span>
                           )}
+                        </TableCell>
+                      ) : null}
+                      {!isCallLog ? (
+                        <TableCell className="max-w-[220px] truncate text-xs text-stone-600">
+                          {getDetailText(item, "email")}
+                        </TableCell>
+                      ) : null}
+                      {!isCallLog ? (
+                        <TableCell>
+                          {(() => {
+                            const status = String(item.detail?.status ?? "");
+                            const failed = status.includes("失败") || status.includes("异常") || Boolean(item.detail?.error);
+                            const success = status.includes("成功") || String(item.summary || "").includes("成功");
+                            return (
+                              <Badge
+                                variant={failed ? "danger" : success ? "success" : "secondary"}
+                                className="rounded-md"
+                              >
+                                {status || (success ? "成功" : failed ? "失败" : "-")}
+                              </Badge>
+                            );
+                          })()}
+                        </TableCell>
+                      ) : null}
+                      {!isCallLog ? (
+                        <TableCell className="max-w-[280px] truncate text-xs text-stone-500" title={String(item.detail?.expires_at_text || item.detail?.error || "")}>
+                          {String(item.detail?.expires_at_text || item.detail?.error || "-")}
                         </TableCell>
                       ) : null}
                       <TableCell className="max-w-[420px] truncate text-stone-500">{item.summary || "-"}</TableCell>

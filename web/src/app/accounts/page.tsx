@@ -11,6 +11,7 @@ import {
   CircleOff,
   Copy,
   Download,
+  KeyRound,
   Link2,
   LoaderCircle,
   LogIn,
@@ -48,6 +49,7 @@ import {
   fetchModels,
   fetchRefreshProgress,
   fetchReLoginProgress,
+  fetchRegisterConfig,
   reLoginAccounts,
   refreshAccounts,
   testProxy,
@@ -93,6 +95,33 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
+
+type MailProviderOption = {
+  provider_ref: string;
+  type: string;
+  label: string;
+  enable: boolean;
+};
+
+/** 与后端 services.register.mail_provider._entries 保持一致 */
+function buildMailProviderOptions(providers: Array<Record<string, unknown>>): MailProviderOption[] {
+  const counters: Record<string, number> = {};
+  return providers.map((item, index) => {
+    const type = String(item.type || "");
+    const idx = index + 1;
+    const cnt = (counters[type] || 0) + 1;
+    counters[type] = cnt;
+    const provider_ref = `${type}#${idx}`;
+    const label = type === "ddg_mail" ? `DDG-${cnt}` : provider_ref;
+    return {
+      provider_ref,
+      type,
+      label,
+      enable: Boolean(item.enable),
+    };
+  });
+}
+
 function formatCompact(value: number) {
   if (value >= 1000) {
     return `${(value / 1000).toFixed(1)}k`;
@@ -126,6 +155,80 @@ function formatRestoreAt(value?: string | null) {
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 
   return { absolute, relative };
+}
+
+function readJwtPayload(token?: string | null): Record<string, unknown> | null {
+  try {
+    const part = String(token || "").split(".")[1];
+    if (!part) {
+      return null;
+    }
+    const padded = part.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (part.length % 4)) % 4);
+    const json = JSON.parse(atob(padded));
+    return json && typeof json === "object" ? (json as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatTokenExpiry(token?: string | null) {
+  const exp = Number(readJwtPayload(token)?.exp || 0);
+  if (!exp) {
+    return {
+      absolute: "—",
+      relative: "无法解析",
+      tone: "text-stone-400",
+      title: "access_token 中没有可解析的 exp",
+    };
+  }
+
+  const date = new Date(exp * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return {
+      absolute: "—",
+      relative: "无效时间",
+      tone: "text-stone-400",
+      title: "",
+    };
+  }
+
+  const diffMs = date.getTime() - Date.now();
+  const pad = (num: number) => String(num).padStart(2, "0");
+  const absolute = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+
+  if (diffMs <= 0) {
+    const overdueMin = Math.max(1, Math.floor(Math.abs(diffMs) / 60000));
+    const overdue =
+      overdueMin >= 1440
+        ? `已过期 ${Math.floor(overdueMin / 1440)}d`
+        : overdueMin >= 60
+          ? `已过期 ${Math.floor(overdueMin / 60)}h`
+          : `已过期 ${overdueMin}m`;
+    return {
+      absolute,
+      relative: overdue,
+      tone: "text-rose-600",
+      title: `access_token 已于 ${absolute} 过期，可点续期刷新凭证`,
+    };
+  }
+
+  const totalMin = Math.ceil(diffMs / 60000);
+  const days = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const mins = totalMin % 60;
+  const relative =
+    days > 0 ? `剩余 ${days}d ${hours}h` : hours > 0 ? `剩余 ${hours}h ${mins}m` : `剩余 ${mins}m`;
+  const tone =
+    totalMin <= 60 ? "text-rose-600" : totalMin <= 24 * 60 ? "text-amber-600" : "text-emerald-600";
+
+  return {
+    absolute,
+    relative,
+    tone,
+    title: `access_token 过期时间 ${absolute}`,
+  };
 }
 
 function formatQuotaSummary(accounts: Account[]) {
@@ -178,6 +281,9 @@ function AccountsPageContent() {
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
   const [editProxy, setEditProxy] = useState("");
+  const [editMailInbox, setEditMailInbox] = useState("");
+  const [editMailProviderRef, setEditMailProviderRef] = useState("");
+  const [mailProviderOptions, setMailProviderOptions] = useState<MailProviderOption[]>([]);
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
@@ -186,6 +292,7 @@ function AccountsPageContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
+  const [renewingTokens, setRenewingTokens] = useState<Set<string>>(new Set());
   const [progress, setProgress] = useState<{
     visible: boolean;
     current: number;
@@ -233,6 +340,19 @@ function AccountsPageContent() {
     }
   };
 
+  const loadMailProviders = async () => {
+    try {
+      const data = await fetchRegisterConfig();
+      const providers = Array.isArray(data.register?.mail?.providers)
+        ? data.register.mail.providers
+        : [];
+      setMailProviderOptions(buildMailProviderOptions(providers));
+    } catch {
+      // 邮箱服务配置加载失败不阻断号池页；编辑时可稍后重试
+      setMailProviderOptions([]);
+    }
+  };
+
   useEffect(() => {
     if (didLoadRef.current) {
       return;
@@ -240,6 +360,7 @@ function AccountsPageContent() {
     didLoadRef.current = true;
     void loadAccounts();
     void loadModels();
+    void loadMailProviders();
 
     // 清理进度条定时器
     return () => {
@@ -487,7 +608,7 @@ function AccountsPageContent() {
           `刷新成功 ${data.refreshed} 个，失败 ${(data.errors ?? []).length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
         );
       } else {
-        toast.success(`刷新成功 ${data.refreshed} 个账户${relogined > 0 ? `，已触发 ${relogined} 个账号重新登录` : ""}`);
+        toast.success(`账号信息刷新成功 ${data.refreshed} 个（额度/状态，不含凭证过期时间）${relogined > 0 ? `，已触发 ${relogined} 个账号重新登录` : ""}`);
       }
     } catch (error) {
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
@@ -649,10 +770,144 @@ function AccountsPageContent() {
     }
   };
 
+  const handleRenewAccounts = async (accessTokens: string[]) => {
+    if (accessTokens.length === 0) {
+      toast.error("请先选择要续期的账户");
+      return;
+    }
+
+    // 有邮箱即可续期：有密码走密码登录，仅邮箱走验证码登录
+    const renewTokens = accessTokens.filter((token) => {
+      const account = accounts.find((a) => a.access_token === token);
+      return Boolean((account?.email ?? "").trim());
+    });
+
+    if (renewTokens.length === 0) {
+      toast.error("选中账号均无邮箱，无法续期（需邮箱；密码可选）");
+      return;
+    }
+
+    if (renewTokens.length < accessTokens.length) {
+      toast.info(`已跳过 ${accessTokens.length - renewTokens.length} 个无邮箱账号`);
+    }
+    setIsRelogining(true);
+    setRenewingTokens(new Set(renewTokens));
+
+    const total = renewTokens.length;
+    setProgress({ visible: true, current: 0, total, message: "正在续期账号凭证...", email: "" });
+
+    try {
+      const { progress_id } = await reLoginAccounts(renewTokens);
+      let finalResults: Array<{
+        token: string;
+        status: string;
+        error?: string | null;
+        email?: string;
+        expires_at_text?: string | null;
+      }> = [];
+
+      await new Promise<void>((resolve, reject) => {
+        const pollTimer = setInterval(async () => {
+          try {
+            const p = await fetchReLoginProgress(progress_id);
+            const results = p.results ?? [];
+            if (p.done) {
+              clearInterval(pollTimer);
+              finalResults = results;
+              if (p.error) {
+                reject(new Error(p.error));
+                return;
+              }
+              setProgress((prev) => ({ ...prev, current: prev.total, message: "续期流程已完成" }));
+              resolve();
+            } else {
+              const lastErrorResult = [...results].reverse().find((r) => r.error);
+              const successCount = results.filter((r) => r.status === "成功").length;
+              const emailHint = lastErrorResult
+                ? `失败: ${lastErrorResult.email || lastErrorResult.token} ${lastErrorResult.error ?? ""}`
+                : `成功 ${successCount} · 已处理 ${p.processed}/${p.total}`;
+              setProgress((prev) => ({
+                ...prev,
+                current: p.processed,
+                email: emailHint,
+                message: "正在续期账号凭证...",
+              }));
+            }
+          } catch (err) {
+            clearInterval(pollTimer);
+            reject(err);
+          }
+        }, 300);
+      });
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+      try {
+        const freshData = await fetchAccounts();
+        setAccounts(freshData.items);
+        setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
+      } catch {
+        /* 静默失败 */
+      }
+
+      const successItems = finalResults.filter((item) => item.status === "成功");
+      const failedItems = finalResults.filter((item) => item.status === "失败" || item.status === "异常" || item.status === "禁用");
+      const skippedItems = finalResults.filter((item) => item.status === "跳过");
+      const successCount = successItems.length;
+      const failedCount = failedItems.length;
+      const skippedCount = skippedItems.length;
+      const expiryHint = successItems
+        .map((item) => item.expires_at_text)
+        .filter(Boolean)
+        .slice(0, 2)
+        .join(" / ");
+      const failHint = failedItems
+        .map((item) => `${item.email || item.token}: ${item.error || item.status}`)
+        .slice(0, 2)
+        .join("；");
+
+      setProgress({
+        visible: true,
+        current: total,
+        total,
+        message: failedCount > 0 && successCount === 0 ? "续期失败" : "续期完成",
+        email: failHint || expiryHint || "",
+      });
+      setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 1200);
+
+      if (successCount === 0 && failedCount > 0) {
+        toast.error(
+          `续期失败 ${failedCount} 个${skippedCount ? `，跳过 ${skippedCount}` : ""}${failHint ? `（${failHint}）` : ""}。详见顶部「日志管理」→ 账号管理日志`,
+        );
+      } else if (failedCount > 0) {
+        toast.warning(
+          `续期成功 ${successCount}，失败 ${failedCount}${skippedCount ? `，跳过 ${skippedCount}` : ""}${expiryHint ? `；新过期: ${expiryHint}` : ""}${failHint ? `；失败: ${failHint}` : ""}`,
+        );
+      } else {
+        toast.success(
+          `续期成功 ${successCount} 个${skippedCount ? `，跳过 ${skippedCount}` : ""}${expiryHint ? `；新过期: ${expiryHint}` : ""}`,
+        );
+      }
+    } catch (error) {
+      setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
+      setRefreshSummary(null);
+      const message = error instanceof Error ? error.message : "账号续期失败";
+      toast.error(message);
+    } finally {
+      setIsRelogining(false);
+      setRenewingTokens(new Set());
+      setRefreshSummary(null);
+    }
+  };
+
   const openEditDialog = (account: Account) => {
     setEditingAccount(account);
     setEditStatus(account.status);
     setEditProxy(account.proxy ?? "");
+    setEditMailInbox(account.mail_inbox ?? "");
+    setEditMailProviderRef(account.mail_provider_ref ?? "");
+    if (mailProviderOptions.length === 0) {
+      void loadMailProviders();
+    }
   };
 
   const handleTestAccountProxy = async () => {
@@ -681,9 +936,13 @@ function AccountsPageContent() {
 
     setIsUpdating(true);
     try {
+      const bound = mailProviderOptions.find((item) => item.provider_ref === editMailProviderRef);
       const data = await updateAccount(editingAccount.access_token, {
         status: editStatus,
         proxy: editProxy.trim(),
+        mail_inbox: editMailInbox.trim(),
+        mail_provider_ref: editMailProviderRef.trim(),
+        mail_provider_type: bound?.type ?? "",
       });
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
@@ -782,7 +1041,7 @@ function AccountsPageContent() {
           <DialogHeader className="gap-2">
             <DialogTitle>编辑账户</DialogTitle>
             <DialogDescription className="text-sm leading-6">
-              手动修改账号状态和专属代理。
+              手动修改账号状态、专属代理，以及续期 OTP 用的邮箱服务绑定。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -822,6 +1081,45 @@ function AccountsPageContent() {
                   测试
                 </Button>
               </div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">续期邮箱服务</label>
+              <Select
+                value={editMailProviderRef || "__none__"}
+                onValueChange={(value) => setEditMailProviderRef(value === "__none__" ? "" : value)}
+              >
+                <SelectTrigger className="h-11 rounded-xl border-stone-200 bg-white">
+                  <SelectValue placeholder="默认 Cloudflare Temp Mail" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">默认 Cloudflare Temp Mail</SelectItem>
+                  {editMailProviderRef &&
+                  !mailProviderOptions.some((item) => item.provider_ref === editMailProviderRef) ? (
+                    <SelectItem value={editMailProviderRef}>
+                      {editMailProviderRef}（当前绑定，配置中已不存在）
+                    </SelectItem>
+                  ) : null}
+                  {mailProviderOptions.map((option) => (
+                    <SelectItem key={option.provider_ref} value={option.provider_ref}>
+                      {option.label}
+                      {option.enable ? "" : "（未启用）"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-stone-500">
+                未选择时默认走 cloudflare_temp_email。仅在账号邮箱不在 CF 服务上时再手动绑定其它服务。
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">OTP 代收邮箱 mail_inbox</label>
+              <Input
+                value={editMailInbox}
+                onChange={(event) => setEditMailInbox(event.target.value)}
+                placeholder="可选；邮件实际落到 CF 代收箱时填写，如 catch@cf-domain.com"
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">登录仍用账号 email；收验证码走此地址（iCloud 等转发场景）</p>
             </div>
           </div>
           <DialogFooter className="pt-2">
@@ -1003,10 +1301,20 @@ function AccountsPageContent() {
                   className="h-8 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700"
                   onClick={() => void handleReLogin(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isRelogining}
-                  title="尝试密码登录恢复账号"
+                  title="仅处理状态为异常的账号"
                 >
                   {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
                   尝试恢复异常账号
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-emerald-600 hover:bg-emerald-50 hover:text-emerald-700"
+                  onClick={() => void handleRenewAccounts(selectedTokens)}
+                  disabled={selectedTokens.length === 0 || isRelogining}
+                  title="主动续期凭证：有密码走密码登录，仅邮箱走验证码登录"
+                >
+                  {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+                  续期选中账号
                 </Button>
                 <Button
                   variant="ghost"
@@ -1035,7 +1343,7 @@ function AccountsPageContent() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1000px] text-left">
+              <table className="w-full min-w-[1180px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
@@ -1050,6 +1358,7 @@ function AccountsPageContent() {
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
+                    <th className="w-40 px-4 py-3">凭证过期</th>
                     <th className="w-24 px-4 py-3">额度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
                     <th className="w-18 px-4 py-3">在途</th>
@@ -1117,7 +1426,17 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                          <div className="space-y-0.5">
+                            <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                            {account.mail_provider_ref ? (
+                              <div className="text-[11px] leading-4 text-emerald-600">
+                                邮服 {account.mail_provider_ref}
+                                {account.mail_inbox ? ` · 代收 ${account.mail_inbox}` : ""}
+                              </div>
+                            ) : account.mail_inbox ? (
+                              <div className="text-[11px] leading-4 text-stone-400">代收 {account.mail_inbox}</div>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {
@@ -1128,6 +1447,17 @@ function AccountsPageContent() {
                               if (isNaN(d.getTime())) return String(raw).slice(0, 10);
                               return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
                             } catch { return String(raw).slice(0, 10); }
+                          })()}
+                        </td>
+                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
+                          {(() => {
+                            const expiry = formatTokenExpiry(account.access_token);
+                            return (
+                              <div className="space-y-0.5" title={expiry.title}>
+                                <div className={cn("font-medium", expiry.tone)}>{expiry.relative}</div>
+                                <div className="text-stone-500">{expiry.absolute}</div>
+                              </div>
+                            );
                           })()}
                         </td>
                         <td className="px-4 py-3">
@@ -1184,14 +1514,29 @@ function AccountsPageContent() {
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => void handleRefreshAccounts([account.access_token])}
                               disabled={isRefreshing || refreshingTokens.has(account.access_token)}
+                              title="刷新账号信息与额度"
                             >
                               <RefreshCw className={cn("size-4", (isRefreshing || refreshingTokens.has(account.access_token)) ? "animate-spin" : "")} />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-emerald-50 hover:text-emerald-600"
+                              onClick={() => void handleRenewAccounts([account.access_token])}
+                              disabled={isRelogining || !(account.email ?? "").trim()}
+                              title={(account.email ?? "").trim() ? "续期凭证（重登刷新 token）" : "无邮箱，无法续期"}
+                            >
+                              {renewingTokens.has(account.access_token) ? (
+                                <LoaderCircle className="size-4 animate-spin" />
+                              ) : (
+                                <KeyRound className="size-4" />
+                              )}
                             </button>
                             <button
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-rose-50 hover:text-rose-500"
                               onClick={() => void handleDeleteTokens([account.access_token])}
                               disabled={isDeleting}
+                              title="删除账号"
                             >
                               <Trash2 className="size-4" />
                             </button>

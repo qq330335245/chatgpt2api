@@ -219,6 +219,17 @@ class AccountService:
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["email"] = normalized.get("email") or None
+        mail_inbox = str(
+            normalized.get("mail_inbox")
+            or normalized.get("otp_inbox")
+            or normalized.get("receive_email")
+            or ""
+        ).strip()
+        normalized["mail_inbox"] = mail_inbox or None
+        mail_provider_ref = str(normalized.get("mail_provider_ref") or "").strip()
+        normalized["mail_provider_ref"] = mail_provider_ref or None
+        mail_provider_type = str(normalized.get("mail_provider_type") or "").strip()
+        normalized["mail_provider_type"] = mail_provider_type or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
         source_type = normalized.get("source_type")
@@ -255,6 +266,30 @@ class AccountService:
         if exp <= 0:
             return None
         return exp - int(time.time())
+
+    @classmethod
+    def _format_token_expiry(cls, access_token: str = "", expires_at: object = None) -> dict[str, Any]:
+        """统一续期/刷新结果日志里的凭证过期字段。"""
+        exp = 0
+        try:
+            exp = int(expires_at or 0)
+        except (TypeError, ValueError):
+            exp = 0
+        if exp <= 0:
+            exp = cls._jwt_exp(access_token)
+        if exp <= 0:
+            return {
+                "expires_at": None,
+                "expires_at_text": None,
+                "expires_in_seconds": None,
+            }
+        dt = datetime.fromtimestamp(exp, tz=timezone.utc)
+        remaining = exp - int(time.time())
+        return {
+            "expires_at": exp,
+            "expires_at_text": dt.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "expires_in_seconds": remaining,
+        }
 
     @classmethod
     def _token_needs_refresh(cls, access_token: str, *, force: bool = False) -> bool:
@@ -427,10 +462,18 @@ class AccountService:
             self._save_accounts()
             self._image_slot_condition.notify_all()
 
+        expiry = self._format_token_expiry(new_token)
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 已刷新 access_token",
-            {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
+            {
+                "source": event,
+                "token": anonymize_token(new_token),
+                "rotated": rotated,
+                "expires_at": expiry.get("expires_at"),
+                "expires_at_text": expiry.get("expires_at_text"),
+                "expires_in_seconds": expiry.get("expires_in_seconds"),
+            },
         )
         return new_token
 
@@ -456,11 +499,10 @@ class AccountService:
                 self._record_token_refresh_error(active_token, event, error_str)
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
                 if "app_session_terminated" in error_str.lower():
-                    # 获取账号信息（email, password）
+                    # 获取账号信息：有密码走密码登录，仅邮箱走验证码登录
                     email = str(account.get("email") or "").strip()
                     password = str(account.get("password") or "").strip()
-                    if email and password:
-                        # 创建新线程执行密码重新登录
+                    if email:
                         t = Thread(
                             target=self._password_re_login_thread,
                             args=(active_token, email, password, event),
@@ -470,13 +512,87 @@ class AccountService:
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
 
+
+    @staticmethod
+    def _relogin_trace(step: str, **fields: Any) -> None:
+        """Print one full re-login step to console for live diagnosis."""
+        parts: list[str] = []
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if isinstance(value, (dict, list, tuple, set)):
+                try:
+                    text_value = json.dumps(value, ensure_ascii=False, default=str)
+                except Exception:
+                    text_value = str(value)
+            else:
+                text_value = str(value)
+            if len(text_value) > 900:
+                text_value = text_value[:900] + "..."
+            parts.append(f"{key}={text_value}")
+        suffix = (" | " + " | ".join(parts)) if parts else ""
+        print(f"[relogin] {step}{suffix}", flush=True)
+
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
-        """密码重新登录线程入口"""
+        """账号重新登录线程入口：有密码走密码登录，无密码走邮箱验证码登录。"""
         try:
-            result = self._login_with_password(email, password)
+            self._relogin_trace(
+                "thread_start",
+                event=event,
+                email=email,
+                has_password=bool(str(password or "").strip()),
+                token=anonymize_token(access_token),
+                progress_id=progress_id or "",
+            )
+            account = self.get_account(access_token) or {}
+            receive_email = str(
+                account.get("mail_inbox")
+                or account.get("otp_inbox")
+                or account.get("receive_email")
+                or ""
+            ).strip()
+            mail_provider_ref = str(account.get("mail_provider_ref") or "").strip()
+            mail_provider_type = str(account.get("mail_provider_type") or "").strip()
+            self._relogin_trace(
+                "account_context",
+                email=email,
+                receive_email=receive_email,
+                mail_provider_ref=mail_provider_ref,
+                mail_provider_type=mail_provider_type,
+                method="password" if str(password or "").strip() else "email_otp",
+            )
+            self._relogin_trace(
+                "login_begin",
+                email=email,
+                method="password" if str(password or "").strip() else "email_otp",
+            )
+            if str(password or "").strip():
+                result = self._login_with_password(
+                    email,
+                    password,
+                    receive_email=receive_email,
+                    mail_provider_ref=mail_provider_ref,
+                    mail_provider_type=mail_provider_type,
+                )
+            else:
+                result = self._login_with_email_otp(
+                    email,
+                    receive_email=receive_email,
+                    mail_provider_ref=mail_provider_ref,
+                    mail_provider_type=mail_provider_type,
+                )
+            login_method = "password" if str(password or "").strip() else "email_otp"
+            self._relogin_trace(
+                "login_result",
+                email=email,
+                method=login_method,
+                ok=bool(result.get("ok")),
+                error=str(result.get("error") or ""),
+                detail=result.get("detail") if not result.get("ok") else None,
+            )
             if result.get("ok"):
                 # 登录成功，更新账号
-                new_access_token = result.get("access_token", "")
+                new_access_token = str(result.get("access_token") or "")
                 new_refresh_token = result.get("refresh_token", "")
                 new_id_token = result.get("id_token", "")
                 new_expires_at = result.get("expires_at")
@@ -493,49 +609,107 @@ class AccountService:
 
                 # 额外更新 source_type 和 status（静默，避免重复日志）
                 self.update_account(new_token, {
-                    "source_type": result.get("source_type", "password"),
+                    "source_type": result.get("source_type", login_method),
                     "status": "正常",
                 }, quiet=True)
 
+                expiry = self._format_token_expiry(new_access_token or new_token, new_expires_at)
+                self._relogin_trace(
+                    "renew_success",
+                    email=email,
+                    method=login_method,
+                    old_token=anonymize_token(access_token),
+                    new_token=anonymize_token(new_access_token or new_token),
+                    expires_at=expiry.get("expires_at"),
+                    expires_at_text=expiry.get("expires_at_text"),
+                    expires_in_seconds=expiry.get("expires_in_seconds"),
+                )
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
-                    "更新账号",
+                    "账号续期成功",
                     {
                         "source": event,
+                        "method": login_method,
                         "old_token": anonymize_token(access_token),
-                        "new_token": anonymize_token(new_access_token),
+                        "new_token": anonymize_token(new_access_token or new_token),
                         "email": email,
                         "status": "成功",
+                        "expires_at": expiry.get("expires_at"),
+                        "expires_at_text": expiry.get("expires_at_text"),
+                        "expires_in_seconds": expiry.get("expires_in_seconds"),
                     },
                 )
                 if progress_id:
-                    self.update_relogin_progress(progress_id, access_token, "成功")
-            else:
-                # 登录失败
-                error_type = result.get("error", "")
-                if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
-                        "更新账号",
-                        {
-                            "source": event,
-                            "token": anonymize_token(access_token),
+                    self.update_relogin_progress(
+                        progress_id,
+                        access_token,
+                        "成功",
+                        extra={
                             "email": email,
-                            "status": "失败",
-                            "error": error_type,
-                            "detail": result.get("detail", {}),
+                            "method": login_method,
+                            "expires_at": expiry.get("expires_at"),
+                            "expires_at_text": expiry.get("expires_at_text"),
+                            "expires_in_seconds": expiry.get("expires_in_seconds"),
                         },
                     )
+            else:
+                # 登录失败
+                error_type = str(result.get("error") or "")
+                soft_errors = {
+                    "need_verification_code",
+                    "otp_timeout",
+                    "otp_mail_unavailable",
+                    "otp_validate_failed",
+                    "otp_no_auth_code",
+                    "otp_max_check_attempts",
+                    "passwordless_send_otp_failed",
+                    "rate_limit_exceeded",
+                    "invalid_state",
+                    "missing_email",
+                    "unexpected_about_you",
+                    "unexpected_login_step",
+                }
+                fail_payload = {
+                    "source": event,
+                    "method": login_method,
+                    "token": anonymize_token(access_token),
+                    "email": email,
+                    "status": "失败",
+                    "error": error_type,
+                    "detail": result.get("detail", {}),
+                }
+                self._relogin_trace(
+                    "renew_failed",
+                    email=email,
+                    method=login_method,
+                    error=error_type,
+                    soft=error_type in soft_errors,
+                    detail=result.get("detail", {}),
+                )
+                if error_type in soft_errors:
+                    fail_payload["soft"] = True
+                    log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
+                    if progress_id:
+                        self.update_relogin_progress(
+                            progress_id,
+                            access_token,
+                            "失败",
+                            error_type,
+                            extra={"email": email, "method": login_method, "detail": result.get("detail", {})},
+                        )
+                    return
+                if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
+                    log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
                     detail_error = result["detail"].get("error", {})
                     if isinstance(detail_error, dict) and detail_error.get("code") == "account_deactivated":
                         # 账号已删除/停用 → 标记为禁用
                         self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
-                        account = self.get_account(access_token) or {}
                         log_service.add(
                             LOG_TYPE_ACCOUNT,
                             "账号已停用-标记禁用",
                             {
                                 "source": event,
+                                "method": login_method,
                                 "token": anonymize_token(access_token),
                                 "email": email,
                                 "detail": result.get("detail", {}),
@@ -549,28 +723,24 @@ class AccountService:
                         if progress_id:
                             self.update_relogin_progress(progress_id, access_token, "异常", error_type)
                 else:
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
-                        "更新账号",
-                        {
-                            "source": event,
-                            "token": anonymize_token(access_token),
-                            "email": email,
-                            "status": "失败",
-                            "error": error_type,
-                            "detail": result.get("detail", {}),
-                        },
-                    )
+                    log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
                     # 永久故障：将账号标记为异常（或自动移除）
                     self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
                     if progress_id:
                         self.update_relogin_progress(progress_id, access_token, "异常", error_type)
         except Exception as exc:
+            self._relogin_trace(
+                "renew_exception",
+                email=email,
+                method="password" if str(password or "").strip() else "email_otp",
+                error=str(exc),
+            )
             log_service.add(
                 LOG_TYPE_ACCOUNT,
-                "更新账号",
+                "账号续期异常",
                 {
                     "source": event,
+                    "method": "password" if str(password or "").strip() else "email_otp",
                     "token": anonymize_token(access_token),
                     "email": email,
                     "status": "异常",
@@ -582,10 +752,963 @@ class AccountService:
             if progress_id:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
 
-    def _login_with_password(self, email: str, password: str) -> dict:
+
+    def _load_relogin_mail_config(self) -> dict:
+        """复用注册页配置的邮箱服务，默认 Cloudflare Temp Mail 等 providers。"""
+        from services.config import DATA_DIR
+
+        mail = {
+            "request_timeout": 30,
+            "wait_timeout": 90,
+            "wait_interval": 2,
+            "providers": [],
+            "api_use_register_proxy": True,
+        }
+        register_proxy = ""
+        try:
+            raw = json.loads((DATA_DIR / "register.json").read_text(encoding="utf-8"))
+            if isinstance(raw.get("mail"), dict):
+                mail = {**mail, **raw["mail"]}
+            register_proxy = str(raw.get("proxy") or "").strip()
+        except Exception:
+            pass
+
+        try:
+            mail["wait_timeout"] = max(float(mail.get("wait_timeout") or 30), 90.0)
+        except Exception:
+            mail["wait_timeout"] = 90.0
+        try:
+            mail["wait_interval"] = max(0.5, float(mail.get("wait_interval") or 2))
+        except Exception:
+            mail["wait_interval"] = 2.0
+
+        use_register_proxy = True
+        flag = mail.get("api_use_register_proxy")
+        if isinstance(flag, bool):
+            use_register_proxy = flag
+        elif str(flag or "").strip().lower() in {"0", "false", "no", "off"}:
+            use_register_proxy = False
+
+        proxy = register_proxy if use_register_proxy else ""
+        if not proxy:
+            try:
+                proxy = str(config.get_proxy_settings() or "").strip()
+            except Exception:
+                proxy = ""
+        mail["proxy"] = proxy
+        mail["api_use_register_proxy"] = use_register_proxy
+        return mail
+
+    @staticmethod
+    def _extract_auth_code_from_payload(data: dict | None) -> str:
+        from urllib.parse import parse_qs, urlparse
+
+        if not isinstance(data, dict):
+            return ""
+        continue_url = str(data.get("continue_url") or "").strip()
+        if not continue_url:
+            return ""
+        try:
+            params = parse_qs(urlparse(continue_url).query)
+        except Exception:
+            return ""
+        return str((params.get("code") or [""])[0]).strip()
+
+    def _send_login_email_otp(self, session, device_id: str, headers: dict) -> None:
+        auth_base = "https://auth.openai.com"
+        otp_headers = dict(headers or {})
+        otp_headers["referer"] = f"{auth_base}/email-verification"
+        otp_headers["oai-device-id"] = device_id
+        try:
+            resp = session.get(
+                f"{auth_base}/api/accounts/email-otp/send",
+                headers=otp_headers,
+                allow_redirects=True,
+                timeout=30,
+            )
+            if getattr(resp, "status_code", None) in (200, 302):
+                return
+        except Exception:
+            pass
+        try:
+            session.post(
+                f"{auth_base}/api/accounts/email-otp/send",
+                headers=otp_headers,
+                json={},
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+    def _validate_login_email_otp(self, session, device_id: str, code: str, headers: dict) -> dict:
+        auth_base = "https://auth.openai.com"
+        otp_headers = dict(headers or {})
+        otp_headers["referer"] = f"{auth_base}/email-verification"
+        otp_headers["oai-device-id"] = device_id
+        otp_headers["content-type"] = "application/json"
+        otp_headers["accept"] = "application/json"
+
+        def _do_validate(current_headers: dict):
+            resp = session.post(
+                f"{auth_base}/api/accounts/email-otp/validate",
+                headers=current_headers,
+                json={"code": code},
+                timeout=30,
+            )
+            data = {}
+            try:
+                data = resp.json() if resp.text else {}
+            except Exception:
+                data = {}
+            return resp, data if isinstance(data, dict) else {}
+
+        resp, data = _do_validate(otp_headers)
+        self._relogin_trace(
+            "otp_validate_attempt",
+            code=code,
+            status=getattr(resp, "status_code", None),
+            has_auth_code=bool(self._extract_auth_code_from_payload(data if isinstance(data, dict) else {})),
+            continue_url=str((data or {}).get("continue_url") or "") if isinstance(data, dict) else "",
+            page=(data.get("page") if isinstance(data, dict) else None),
+            body_preview=data if isinstance(data, dict) else {},
+        )
+        if getattr(resp, "status_code", None) != 200:
+            try:
+                from utils.sentinel import build_sentinel_token
+
+                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "authorize_continue")
+                otp_headers["openai-sentinel-token"] = sentinel_val
+                if oai_sc_val:
+                    session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
+                    session.cookies.set("oai-sc", oai_sc_val, domain=".auth.openai.com")
+            except Exception:
+                pass
+            resp, data = _do_validate(otp_headers)
+
+            self._relogin_trace(
+                "otp_validate_retry",
+                code=code,
+                status=getattr(resp, "status_code", None),
+                has_auth_code=bool(self._extract_auth_code_from_payload(data if isinstance(data, dict) else {})),
+                continue_url=str((data or {}).get("continue_url") or "") if isinstance(data, dict) else "",
+                page=(data.get("page") if isinstance(data, dict) else None),
+            )
+
+        if getattr(resp, "status_code", None) != 200:
+            self._relogin_trace(
+                "otp_validate_http_failed",
+                code=code,
+                status=getattr(resp, "status_code", None),
+                detail=data or (getattr(resp, "text", None) or "")[:300],
+            )
+            return {
+                "ok": False,
+                "error": "otp_validate_failed",
+                "detail": data or {
+                    "status": getattr(resp, "status_code", None),
+                    "text": (getattr(resp, "text", None) or "")[:300],
+                },
+            }
+
+        auth_code = self._extract_auth_code_from_payload(data)
+        if not auth_code:
+            continue_url = str(data.get("continue_url") or "").strip()
+            if continue_url:
+                try:
+                    follow = session.get(
+                        continue_url,
+                        headers={
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "user-agent": self._OAUTH_USER_AGENT,
+                            "referer": f"{auth_base}/email-verification",
+                        },
+                        allow_redirects=True,
+                        timeout=30,
+                    )
+                    from urllib.parse import parse_qs, urlparse
+
+                    candidates = [str(getattr(follow, "url", "") or "")]
+                    history = getattr(follow, "history", None) or []
+                    candidates.extend(str(getattr(item, "url", "") or "") for item in history)
+                    for url in candidates:
+                        if not url:
+                            continue
+                        params = parse_qs(urlparse(url).query)
+                        auth_code = str((params.get("code") or [""])[0]).strip()
+                        if auth_code:
+                            break
+                except Exception:
+                    pass
+
+        page_type = ""
+        if isinstance(data, dict) and isinstance(data.get("page"), dict):
+            page_type = str(data.get("page", {}).get("type") or "")
+        continue_url = str((data or {}).get("continue_url") or "") if isinstance(data, dict) else ""
+        self._relogin_trace(
+            "otp_validate_done",
+            code=code,
+            has_auth_code=bool(auth_code),
+            auth_code_prefix=(auth_code[:8] + "...") if auth_code else "",
+            continue_url=continue_url,
+            page_type=page_type,
+            about_you=("about-you" in continue_url or page_type == "about_you"),
+        )
+        return {"ok": True, "auth_code": auth_code, "detail": data}
+
+    def _complete_email_otp_login(
+        self,
+        session,
+        device_id: str,
+        email: str,
+        headers: dict,
+        *,
+        send_otp: bool = True,
+        receive_email: str = "",
+        mail_provider_ref: str = "",
+        mail_provider_type: str = "",
+    ) -> dict:
+        """通过配置的邮箱服务收信并完成 email-otp/validate。
+
+        receive_email: 代收箱地址（如 CF catch-all）
+        mail_provider_ref/type: 账号绑定的邮箱服务，避免多服务时顺序盲试
+        """
+        from services.register import mail_provider
+
+        self._relogin_trace(
+            "otp_complete_begin",
+            email=email,
+            receive_email=receive_email,
+            mail_provider_ref=mail_provider_ref,
+            mail_provider_type=mail_provider_type,
+            send_otp=send_otp,
+        )
+        try:
+            mail_config = self._load_relogin_mail_config()
+            providers = mail_config.get("providers") if isinstance(mail_config.get("providers"), list) else []
+            if not providers:
+                return {
+                    "ok": False,
+                    "error": "otp_mail_unavailable",
+                    "detail": {"message": "register mail.providers 为空，请先配置邮箱服务"},
+                }
+            mailbox = mail_provider.get_existing_mailbox(
+                mail_config,
+                email,
+                receive_email=str(receive_email or "").strip(),
+                provider_ref=str(mail_provider_ref or "").strip(),
+                provider_type=str(mail_provider_type or "").strip(),
+            )
+            self._relogin_trace(
+                "otp_mailbox_ready",
+                email=email,
+                mailbox_email=str((mailbox or {}).get("email") or (mailbox or {}).get("address") or ""),
+                inbox=str((mailbox or {}).get("inbox") or (mailbox or {}).get("receive_email") or receive_email or ""),
+                provider=str((mailbox or {}).get("provider") or (mailbox or {}).get("provider_type") or mail_provider_type or ""),
+                provider_ref=str((mailbox or {}).get("provider_ref") or mail_provider_ref or ""),
+                wait_timeout=mail_config.get("wait_timeout"),
+                wait_interval=mail_config.get("wait_interval"),
+                proxy=bool(str(mail_config.get("proxy") or "").strip()),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": "otp_mail_unavailable",
+                "detail": {
+                    "message": str(exc),
+                    "email": email,
+                    "receive_email": receive_email,
+                    "mail_provider_ref": mail_provider_ref,
+                    "mail_provider_type": mail_provider_type,
+                },
+            }
+
+        if send_otp:
+            self._send_login_email_otp(session, device_id, headers)
+            self._relogin_trace("otp_send_email_otp", email=email, path="email-otp/send")
+        # 发码后再开窗；只略向前，避免共享代收箱旧码误用
+        mailbox["_code_not_before"] = datetime.now(timezone.utc) - timedelta(seconds=15)
+
+        tried: set[str] = set()
+        deadline = time.time() + float(mail_config.get("wait_timeout") or 90)
+        last_detail: dict[str, Any] = {}
+        while time.time() < deadline:
+            remaining = max(2.0, deadline - time.time())
+            poll_config = {**mail_config, "wait_timeout": min(remaining, 15.0)}
+            try:
+                code = mail_provider.wait_for_code(poll_config, mailbox)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": "otp_mail_unavailable",
+                    "detail": {"message": str(exc), "email": email},
+                }
+            if not code or code in tried:
+                continue
+            tried.add(code)
+            self._relogin_trace(
+                "otp_code_received",
+                email=email,
+                code=code,
+                tried_before=sorted(tried - {code}),
+                remaining=round(max(0.0, deadline - time.time()), 1),
+            )
+            result = self._validate_login_email_otp(session, device_id, code, headers)
+            if result.get("ok"):
+                if str(result.get("auth_code") or "").strip():
+                    self._relogin_trace(
+                        "otp_code_accepted",
+                        email=email,
+                        code=code,
+                        auth_code_prefix=str(result.get("auth_code") or "")[:8] + "...",
+                    )
+                    return result
+                last_detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
+                page = last_detail.get("page") if isinstance(last_detail.get("page"), dict) else {}
+                self._relogin_trace(
+                    "otp_validate_ok_no_auth_code",
+                    email=email,
+                    code=code,
+                    continue_url=str(last_detail.get("continue_url") or ""),
+                    page_type=str(page.get("type") or ""),
+                    about_you=(
+                        "about-you" in str(last_detail.get("continue_url") or "")
+                        or str(page.get("type") or "") == "about_you"
+                    ),
+                    detail=last_detail,
+                )
+                continue
+            last_detail = result.get("detail") if isinstance(result.get("detail"), dict) else {"error": result.get("error")}
+            detail_text = json.dumps(last_detail, ensure_ascii=False).lower()
+            if "max_check_attempts" in detail_text or "too many tries" in detail_text:
+                self._relogin_trace(
+                    "otp_max_check_attempts",
+                    email=email,
+                    tried=sorted(tried),
+                    last=last_detail,
+                )
+                return {
+                    "ok": False,
+                    "error": "otp_max_check_attempts",
+                    "detail": {"email": email, "tried": sorted(tried), "last": last_detail},
+                }
+            # 错误验证码：继续等待下一封邮件
+
+        self._relogin_trace(
+            "otp_timeout",
+            email=email,
+            tried=sorted(tried),
+            last=last_detail,
+        )
+        return {
+            "ok": False,
+            "error": "otp_timeout",
+            "detail": {"email": email, "tried": sorted(tried), "last": last_detail},
+        }
+
+
+    def _send_passwordless_login_otp(self, session, device_id: str, headers: dict) -> tuple[bool, str]:
+        """触发无密码邮箱 OTP：优先 passwordless/send-otp，失败再回退 email-otp/send。"""
+        auth_base = "https://auth.openai.com"
+        otp_headers = dict(headers or {})
+        otp_headers["accept"] = "application/json"
+        otp_headers["content-type"] = "application/json"
+        otp_headers["oai-device-id"] = device_id
+        otp_headers.setdefault("referer", f"{auth_base}/log-in/password")
+        otp_headers.setdefault("origin", auth_base)
+
+        try:
+            resp = session.post(
+                f"{auth_base}/api/accounts/passwordless/send-otp",
+                headers=otp_headers,
+                data=b"",
+                timeout=30,
+            )
+            if getattr(resp, "status_code", None) == 200:
+                self._relogin_trace("passwordless_send_otp_ok", path="passwordless/send-otp")
+                return True, ""
+            detail = (getattr(resp, "text", None) or "")[:200]
+            last_error = f"passwordless/send-otp_http_{getattr(resp, 'status_code', 'unknown')}:{detail}"
+            self._relogin_trace("passwordless_send_otp_fail", error=last_error)
+        except Exception as exc:
+            last_error = f"passwordless/send-otp_exception:{exc}"
+            self._relogin_trace("passwordless_send_otp_exception", error=last_error)
+
+        # 回退到通用 email-otp/send
+        try:
+            self._send_login_email_otp(session, device_id, otp_headers)
+            self._relogin_trace("passwordless_fallback_email_otp_send", previous_error=last_error)
+            return True, last_error
+        except Exception as exc:
+            self._relogin_trace("passwordless_fallback_failed", error=f"{last_error}; email-otp/send_exception:{exc}")
+            return False, f"{last_error}; email-otp/send_exception:{exc}"
+
+
+    @staticmethod
+    def _classify_login_step(
+        *,
+        page_type: str = "",
+        continue_url: str = "",
+        current_url: str = "",
+        detail: dict | None = None,
+    ) -> dict[str, Any]:
+        """Align with codex-console: detect password page / email OTP / about-you / auth code."""
+        detail = detail if isinstance(detail, dict) else {}
+        page = detail.get("page") if isinstance(detail.get("page"), dict) else {}
+        resolved_page_type = str(page_type or page.get("type") or "").strip().lower()
+        resolved_continue = str(continue_url or detail.get("continue_url") or "").strip()
+        resolved_current = str(current_url or "").strip()
+        blob = f"{resolved_page_type} {resolved_continue} {resolved_current}".lower()
+
+        auth_code = AccountService._extract_auth_code_from_payload(detail)
+
+        needs_login_password = (
+            resolved_page_type == "login_password"
+            or "log-in/password" in blob
+            or "/login/password" in blob
+        )
+        needs_email_otp = (
+            resolved_page_type in {"email_otp_verification", "email_otp", "email_verification"}
+            or "email-verification" in blob
+            or "email-otp" in blob
+            or "email_otp" in blob
+        )
+        is_about_you = resolved_page_type == "about_you" or "about-you" in blob
+        is_create_account = (
+            "create-account" in blob
+            or resolved_page_type in {"create_account", "password_registration"}
+        ) and not needs_login_password and not needs_email_otp and not is_about_you
+
+        return {
+            "page_type": resolved_page_type,
+            "continue_url": resolved_continue,
+            "current_url": resolved_current,
+            "auth_code": auth_code,
+            "needs_login_password": needs_login_password,
+            "needs_email_otp": needs_email_otp,
+            "is_about_you": is_about_you,
+            "is_create_account": is_create_account,
+        }
+
+    def _authorize_continue_with_email(self, session, device_id: str, email: str, headers: dict, referer: str = "", screen_hint: str = "login_or_signup") -> dict:
+        """提交邮箱进入登录态（passwordless 需要）。"""
+        auth_base = "https://auth.openai.com"
+        continue_headers = dict(headers or {})
+        continue_headers["accept"] = "application/json"
+        continue_headers["content-type"] = "application/json"
+        continue_headers["origin"] = auth_base
+        continue_headers["referer"] = referer or f"{auth_base}/log-in"
+        continue_headers["oai-device-id"] = device_id
+        try:
+            from utils.sentinel import build_sentinel_token
+
+            sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "authorize_continue")
+            continue_headers["openai-sentinel-token"] = sentinel_val
+            if oai_sc_val:
+                session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
+                session.cookies.set("oai-sc", oai_sc_val, domain=".auth.openai.com")
+        except Exception:
+            pass
+
+        try:
+            resp = session.post(
+                f"{auth_base}/api/accounts/authorize/continue",
+                headers=continue_headers,
+                json={
+                    "username": {"kind": "email", "value": email},
+                    "screen_hint": str(screen_hint or "login_or_signup").strip() or "login_or_signup",
+                },
+                timeout=30,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": "authorize_continue_exception", "detail": {"message": str(exc)}}
+
+        data: dict[str, Any] = {}
+        try:
+            data = resp.json() if resp.text else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        if getattr(resp, "status_code", None) != 200:
+            self._relogin_trace(
+                "authorize_continue_failed",
+                email=email,
+                status=getattr(resp, "status_code", None),
+                detail=data or {"text": (getattr(resp, "text", None) or "")[:300]},
+            )
+            return {
+                "ok": False,
+                "error": f"authorize_continue_failed_{getattr(resp, 'status_code', 'unknown')}",
+                "detail": data or {"text": (getattr(resp, "text", None) or "")[:300]},
+            }
+        page = data.get("page") if isinstance(data.get("page"), dict) else {}
+        self._relogin_trace(
+            "authorize_continue_ok",
+            email=email,
+            continue_url=str(data.get("continue_url") or ""),
+            page_type=str(page.get("type") or ""),
+            screen_hint=str(screen_hint or "login_or_signup"),
+            detail_keys=sorted(list(data.keys())) if isinstance(data, dict) else [],
+        )
+        return {"ok": True, "detail": data}
+
+    def _build_login_token_result(
+        self,
+        session,
+        *,
+        email: str,
+        access_token: str,
+        refresh_token: str,
+        id_token: str,
+        source_type: str,
+        user_agent: str,
+    ) -> dict:
+        user_info: dict[str, Any] = {}
+        try:
+            me_resp = session.get(
+                "https://chatgpt.com/backend-api/me",
+                headers={
+                    "accept": "application/json",
+                    "authorization": f"Bearer {access_token}",
+                    "user-agent": user_agent,
+                },
+                timeout=30,
+            )
+            if me_resp.status_code == 200:
+                payload = me_resp.json() if me_resp.text else {}
+                if isinstance(payload, dict):
+                    user_info = payload
+        except Exception:
+            pass
+
+        jwt_payload = self._decode_jwt_payload(access_token)
+        email_from_jwt = str(jwt_payload.get("https://api.openai.com/profile", {}).get("email") or "").strip()
+        account_id_from_jwt = str(
+            jwt_payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id") or ""
+        ).strip()
+        account_info = user_info.get("account") if isinstance(user_info.get("account"), dict) else {}
+        return {
+            "ok": True,
+            "email": email_from_jwt or email,
+            "account_id": account_id_from_jwt or account_info.get("account_id", ""),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "expires_at": jwt_payload.get("exp"),
+            "source_type": source_type,
+        }
+
+    def _login_with_email_otp(
+        self,
+        email: str,
+        receive_email: str = "",
+        mail_provider_ref: str = "",
+        mail_provider_type: str = "",
+    ) -> dict:
+        """仅邮箱 + 邮箱验证码（passwordless）登录，返回 token 结果。"""
+        from curl_cffi import requests
+        from urllib.parse import parse_qs, urlparse
+
+        email = str(email or "").strip()
+        if not email:
+            return {"ok": False, "error": "missing_email", "detail": {}}
+
+        self._relogin_trace(
+            "email_otp_begin",
+            email=email,
+            receive_email=receive_email,
+            mail_provider_ref=mail_provider_ref,
+            mail_provider_type=mail_provider_type,
+            screen_hint="login_or_signup",
+            entry="email_otp_via_login_or_signup",
+        )
+
+        auth_base = "https://auth.openai.com"
+        platform_oauth_audience = "https://api.openai.com/v1"
+        platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+        platform_oauth_client_id = self._OAUTH_CLIENT_ID
+        platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
+        user_agent = self._OAUTH_USER_AGENT
+
+        session_kwargs = {"impersonate": "chrome110", "verify": False}
+        proxy = config.get_proxy_settings()
+        if proxy:
+            session_kwargs["proxy"] = proxy
+        session = requests.Session(**session_kwargs)
+
+        try:
+            device_id = str(uuid.uuid4())
+            from utils.pkce import generate_pkce
+
+            code_verifier, code_challenge = generate_pkce()
+
+            session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+            session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+            params = {
+                "issuer": auth_base,
+                "client_id": platform_oauth_client_id,
+                "audience": platform_oauth_audience,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "device_id": device_id,
+                "screen_hint": "login_or_signup",
+                "max_age": "0",
+                "login_hint": email,
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": secrets.token_urlsafe(32),
+                "nonce": secrets.token_urlsafe(32),
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "auth0Client": platform_auth0_client,
+                "prompt": "login",
+            }
+            authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+            resp = session.get(
+                authorize_url,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "user-agent": user_agent,
+                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "cross-site",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                    "referer": "https://platform.openai.com/",
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+            self._relogin_trace(
+                "email_otp_authorize",
+                email=email,
+                status=resp.status_code,
+                final_url=str(resp.url),
+                screen_hint="login_or_signup",
+            )
+            if resp.status_code not in (200, 302):
+                return {
+                    "ok": False,
+                    "error": f"authorize_failed_{resp.status_code}",
+                    "detail": {"url": str(resp.url), "text": (resp.text or "")[:500]},
+                }
+
+            final_url = str(resp.url)
+            if "/error" in final_url and "payload=" in final_url:
+                try:
+                    parsed_query = parse_qs(urlparse(final_url).query)
+                    error_payload_b64 = parsed_query.get("payload", [""])[0]
+                    error_payload_b64 += "=" * ((4 - len(error_payload_b64) % 4) % 4)
+                    error_payload = json.loads(base64.b64decode(error_payload_b64))
+                    error_code = error_payload.get("errorCode", "")
+                    self._relogin_trace(
+                        "email_otp_authorize_error_page",
+                        email=email,
+                        error_code=error_code,
+                        detail=error_payload,
+                    )
+                    if error_code == "rate_limit_exceeded":
+                        return {"ok": False, "error": "rate_limit_exceeded", "detail": error_payload}
+                    return {"ok": False, "error": f"authorize_error_{error_code}", "detail": error_payload}
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "error": "authorize_redirect_error",
+                        "detail": {"url": final_url, "parse_error": str(exc)},
+                    }
+
+            login_headers = {
+                "accept": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "content-type": "application/json",
+                "origin": auth_base,
+                "priority": "u=1, i",
+                "user-agent": user_agent,
+                "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "referer": final_url if final_url.startswith(auth_base) else f"{auth_base}/log-in",
+                "oai-device-id": device_id,
+            }
+
+            continue_result = self._authorize_continue_with_email(
+                session,
+                device_id,
+                email,
+                login_headers,
+                referer=login_headers["referer"],
+                screen_hint="login_or_signup",
+            )
+            continue_detail = continue_result.get("detail") if isinstance(continue_result.get("detail"), dict) else {}
+            if not continue_result.get("ok"):
+                # login_hint 有时已足够进入登录态，continue 失败不立刻中断
+                self._relogin_trace(
+                    "email_otp_continue_soft_fail",
+                    email=email,
+                    error=str(continue_result.get("error") or ""),
+                    detail=continue_detail,
+                )
+
+            step = self._classify_login_step(
+                detail=continue_detail,
+                current_url=final_url,
+            )
+            # authorize 落地 URL 也纳入判断（login_hint 可能直接落到密码/OTP 页）
+            if not step.get("needs_login_password") and not step.get("needs_email_otp") and not step.get("auth_code"):
+                step = self._classify_login_step(
+                    detail=continue_detail,
+                    current_url=final_url,
+                    continue_url=str(continue_detail.get("continue_url") or final_url),
+                )
+            self._relogin_trace(
+                "email_otp_step_classified",
+                email=email,
+                page_type=step.get("page_type"),
+                continue_url=step.get("continue_url"),
+                current_url=final_url,
+                needs_login_password=bool(step.get("needs_login_password")),
+                needs_email_otp=bool(step.get("needs_email_otp")),
+                is_about_you=bool(step.get("is_about_you")),
+                has_auth_code=bool(step.get("auth_code")),
+            )
+
+            auth_code = str(step.get("auth_code") or "").strip()
+            otp_result: dict[str, Any] = {"ok": False, "auth_code": "", "detail": continue_detail}
+
+            if auth_code:
+                self._relogin_trace("email_otp_got_code_before_otp", email=email, auth_code_prefix=auth_code[:8] + "...")
+                otp_result = {"ok": True, "auth_code": auth_code, "detail": continue_detail}
+            elif step.get("is_about_you") and not step.get("needs_login_password") and not step.get("needs_email_otp"):
+                self._relogin_trace(
+                    "email_otp_unexpected_about_you",
+                    email=email,
+                    detail=continue_detail,
+                    final_url=final_url,
+                )
+                return {
+                    "ok": False,
+                    "error": "unexpected_about_you",
+                    "detail": continue_detail or {"url": final_url},
+                }
+            else:
+                # codex-console: 只有落到密码页时，才主动切 passwordless 邮箱验证码
+                need_passwordless = bool(step.get("needs_login_password"))
+                already_otp = bool(step.get("needs_email_otp"))
+                if not need_passwordless and not already_otp:
+                    # continue 失败/状态不清时，若 URL 像密码页则仍按密码页处理
+                    lowered = final_url.lower()
+                    if "log-in/password" in lowered or "/login/password" in lowered:
+                        need_passwordless = True
+                    elif "email-verification" in lowered or "email-otp" in lowered:
+                        already_otp = True
+
+                if need_passwordless:
+                    pwd_headers = dict(login_headers)
+                    pwd_headers["referer"] = f"{auth_base}/log-in/password"
+                    self._relogin_trace(
+                        "email_otp_switch_passwordless_from_password_page",
+                        email=email,
+                        referer=pwd_headers["referer"],
+                    )
+                    send_ok, send_detail = self._send_passwordless_login_otp(session, device_id, pwd_headers)
+                    self._relogin_trace(
+                        "email_otp_send_result",
+                        email=email,
+                        ok=send_ok,
+                        detail=send_detail or "",
+                        trigger="login_password",
+                    )
+                    if not send_ok:
+                        return {
+                            "ok": False,
+                            "error": "passwordless_send_otp_failed",
+                            "detail": {"message": send_detail, "email": email, "page": "login_password"},
+                        }
+                    send_otp = False
+                elif already_otp:
+                    self._relogin_trace(
+                        "email_otp_already_on_verification_page",
+                        email=email,
+                        continue_url=step.get("continue_url") or final_url,
+                    )
+                    # authorize 已落到验证码页时，OpenAI 通常已自动发码；先收码，失败后再补发
+                    send_otp = False
+                else:
+                    self._relogin_trace(
+                        "email_otp_unexpected_step",
+                        email=email,
+                        page_type=step.get("page_type"),
+                        continue_url=step.get("continue_url"),
+                        final_url=final_url,
+                        detail=continue_detail,
+                    )
+                    return {
+                        "ok": False,
+                        "error": "unexpected_login_step",
+                        "detail": {
+                            "email": email,
+                            "page_type": step.get("page_type"),
+                            "continue_url": step.get("continue_url"),
+                            "final_url": final_url,
+                            "continue": continue_detail,
+                        },
+                    }
+
+                otp_headers = dict(login_headers)
+                otp_headers["referer"] = f"{auth_base}/email-verification"
+                otp_result = self._complete_email_otp_login(
+                    session=session,
+                    device_id=device_id,
+                    email=email,
+                    headers=otp_headers,
+                    send_otp=send_otp,
+                    receive_email=receive_email,
+                    mail_provider_ref=mail_provider_ref,
+                    mail_provider_type=mail_provider_type,
+                )
+            if not otp_result.get("ok"):
+                err = str(otp_result.get("error") or "")
+                self._relogin_trace(
+                    "email_otp_complete_first_fail",
+                    email=email,
+                    error=err,
+                    detail=otp_result.get("detail"),
+                )
+                if err in {"otp_max_check_attempts", "rate_limit_exceeded", "otp_mail_unavailable"}:
+                    return otp_result
+                # 首轮未发出/漏信时再补一次通用 send
+                self._relogin_trace("email_otp_resend_email_otp", email=email)
+                self._send_login_email_otp(session, device_id, otp_headers)
+                otp_result = self._complete_email_otp_login(
+                    session=session,
+                    device_id=device_id,
+                    email=email,
+                    headers=otp_headers,
+                    send_otp=False,
+                    receive_email=receive_email,
+                    mail_provider_ref=mail_provider_ref,
+                    mail_provider_type=mail_provider_type,
+                )
+                if not otp_result.get("ok"):
+                    self._relogin_trace(
+                        "email_otp_complete_second_fail",
+                        email=email,
+                        error=str(otp_result.get("error") or ""),
+                        detail=otp_result.get("detail"),
+                    )
+                    return otp_result
+
+            auth_code = str(otp_result.get("auth_code") or "").strip()
+            if not auth_code:
+                self._relogin_trace(
+                    "email_otp_no_auth_code",
+                    email=email,
+                    detail=otp_result.get("detail") or {},
+                )
+                return {
+                    "ok": False,
+                    "error": "otp_no_auth_code",
+                    "detail": otp_result.get("detail") or {},
+                }
+
+            self._relogin_trace(
+                "email_otp_token_exchange_begin",
+                email=email,
+                auth_code_prefix=auth_code[:8] + "...",
+            )
+            platform_base = "https://platform.openai.com"
+            token_resp = session.post(
+                f"{auth_base}/api/accounts/oauth/token",
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "auth0-client": platform_auth0_client,
+                    "cache-control": "no-cache",
+                    "content-type": "application/json",
+                    "origin": platform_base,
+                    "pragma": "no-cache",
+                    "priority": "u=1, i",
+                    "referer": f"{platform_base}/",
+                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-site",
+                    "user-agent": user_agent,
+                },
+                json={
+                    "client_id": platform_oauth_client_id,
+                    "code_verifier": code_verifier,
+                    "grant_type": "authorization_code",
+                    "code": auth_code,
+                    "redirect_uri": platform_oauth_redirect_uri,
+                },
+                verify=False,
+                timeout=60,
+            )
+            token_data: dict[str, Any] = {}
+            try:
+                token_data = token_resp.json() if token_resp.text else {}
+            except Exception:
+                token_data = {}
+            if token_resp.status_code != 200 or not token_data.get("access_token"):
+                self._relogin_trace(
+                    "email_otp_token_exchange_failed",
+                    email=email,
+                    status=token_resp.status_code,
+                    detail=token_data,
+                )
+                return {"ok": False, "error": "token_exchange_failed", "detail": token_data}
+
+            result = self._build_login_token_result(
+                session,
+                email=email,
+                access_token=str(token_data.get("access_token") or "").strip(),
+                refresh_token=str(token_data.get("refresh_token") or "").strip(),
+                id_token=str(token_data.get("id_token") or "").strip(),
+                source_type="email_otp",
+                user_agent=user_agent,
+            )
+            self._relogin_trace(
+                "email_otp_success",
+                email=result.get("email") or email,
+                account_id=result.get("account_id"),
+                expires_at=result.get("expires_at"),
+                has_refresh_token=bool(result.get("refresh_token")),
+            )
+            return result
+        finally:
+            session.close()
+
+    def _login_with_password(
+        self,
+        email: str,
+        password: str,
+        receive_email: str = "",
+        mail_provider_ref: str = "",
+        mail_provider_type: str = "",
+    ) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
         from curl_cffi import requests
         
+        self._relogin_trace(
+            "password_login_begin",
+            email=email,
+            receive_email=receive_email,
+            mail_provider_ref=mail_provider_ref,
+            mail_provider_type=mail_provider_type,
+            screen_hint="login_or_signup",
+            entry="password",
+        )
         # 常量
         auth_base = "https://auth.openai.com"
         platform_oauth_audience = "https://api.openai.com/v1"
@@ -652,6 +1775,13 @@ class AccountService:
                 timeout=30,
             )
             
+            self._relogin_trace(
+                "password_authorize",
+                email=email,
+                status=resp.status_code,
+                final_url=str(resp.url),
+                screen_hint="login_or_signup",
+            )
             if resp.status_code not in (200, 302):
                 return {"ok": False, "error": f"authorize_failed_{resp.status_code}", "detail": {"url": resp.url, "text": resp.text[:500]}}
             
@@ -713,9 +1843,26 @@ class AccountService:
             except Exception:
                 pass
             
+            page_info = login_data.get("page") if isinstance(login_data.get("page"), dict) else {}
+            self._relogin_trace(
+                "password_verify_result",
+                email=email,
+                status=login_resp.status_code,
+                continue_url=str(login_data.get("continue_url") or ""),
+                page_type=str(page_info.get("type") or ""),
+                has_code=bool(self._extract_auth_code_from_payload(login_data if isinstance(login_data, dict) else {})),
+            )
             if login_resp.status_code != 200:
                 error_code = login_data.get("error", {}).get("code", "")
                 error_msg = login_data.get("error", {}).get("message", "")
+                self._relogin_trace(
+                    "password_verify_failed",
+                    email=email,
+                    status=login_resp.status_code,
+                    error_code=error_code,
+                    error_msg=error_msg,
+                    detail=login_data,
+                )
                 if error_code == "unsupported_country_region_territory":
                     return {"ok": False, "error": "unsupported_country_region_territory", "detail": login_data}
                 elif error_code == "invalid_state":
@@ -739,9 +1886,38 @@ class AccountService:
                 if isinstance(page_info, dict):
                     page_type = str(page_info.get("type") or "")
                 
-                if page_type == "email_otp_verification":
-                    # 需要验证码才能登录，直接标记为账号异常
-                    return {"ok": False, "error": "need_verification_code", "detail": login_data}
+                needs_otp = (
+                    page_type == "email_otp_verification"
+                    or "email-verification" in continue_url
+                    or "email-otp" in continue_url
+                    or "email_otp" in page_type
+                )
+                self._relogin_trace(
+                    "password_needs_otp",
+                    email=email,
+                    needs_otp=needs_otp,
+                    page_type=page_type,
+                    continue_url=continue_url,
+                )
+                if needs_otp:
+                    otp_result = self._complete_email_otp_login(
+                        session=session,
+                        device_id=device_id,
+                        email=email,
+                        headers=login_headers,
+                        receive_email=receive_email,
+                        mail_provider_ref=mail_provider_ref,
+                        mail_provider_type=mail_provider_type,
+                    )
+                    if not otp_result.get("ok"):
+                        return otp_result
+                    auth_code = str(otp_result.get("auth_code") or "").strip()
+                    if not auth_code:
+                        return {
+                            "ok": False,
+                            "error": "otp_no_auth_code",
+                            "detail": otp_result.get("detail") or login_data,
+                        }
                 else:
                     return {"ok": False, "error": "no_auth_code", "detail": login_data}
             
@@ -785,7 +1961,19 @@ class AccountService:
                 pass
             
             if token_resp.status_code != 200 or not token_data.get("access_token"):
+                self._relogin_trace(
+                    "password_token_exchange_failed",
+                    email=email,
+                    status=token_resp.status_code,
+                    detail=token_data,
+                )
                 return {"ok": False, "error": "token_exchange_failed", "detail": token_data}
+
+            self._relogin_trace(
+                "password_token_exchange_ok",
+                email=email,
+                has_refresh_token=bool(token_data.get("refresh_token")),
+            )
             
             access_token = str(token_data.get("access_token") or "").strip()
             refresh_token = str(token_data.get("refresh_token") or "").strip()
@@ -827,6 +2015,13 @@ class AccountService:
                 "expires_at": jwt_payload.get("exp"),
                 "source_type": "password",
             }
+            self._relogin_trace(
+                "password_login_success",
+                email=result.get("email") or email,
+                account_id=result.get("account_id"),
+                expires_at=result.get("expires_at"),
+                has_refresh_token=bool(result.get("refresh_token")),
+            )
             
             return result
         
@@ -1423,18 +2618,31 @@ class AccountService:
                 "results": [],
             }
 
-    def update_relogin_progress(self, progress_id: str, token: str, status: str, error: str | None = None) -> None:
+    def update_relogin_progress(
+        self,
+        progress_id: str,
+        token: str,
+        status: str,
+        error: str | None = None,
+        extra: dict | None = None,
+    ) -> None:
         """更新单个重新登录进度。当所有账号处理完毕时自动标记完成。"""
         with self._relogin_progress_lock:
             progress = self._relogin_progress.get(progress_id)
             if progress is None:
                 return
             progress["processed"] += 1
-            progress["results"].append({
+            item = {
                 "token": anonymize_token(token),
                 "status": status,
                 "error": error,
-            })
+            }
+            if isinstance(extra, dict):
+                for key, value in extra.items():
+                    if key in {"token", "status", "error"}:
+                        continue
+                    item[key] = value
+            progress["results"].append(item)
             if progress["processed"] >= progress["total"]:
                 progress["done"] = True
 
@@ -1526,7 +2734,7 @@ class AccountService:
                     continue
                 email = str(account.get("email") or "").strip()
                 password = str(account.get("password") or "").strip()
-                if not email or not password:
+                if not email:
                     continue
                 t = Thread(
                     target=self._password_re_login_thread,
@@ -1549,9 +2757,15 @@ class AccountService:
         return result
 
     def re_login_accounts(self, access_tokens: list[str], progress_id: str | None = None) -> dict[str, Any]:
-        """对选中账号执行密码重新登录流程。
+        self._relogin_trace(
+            "batch_start",
+            count=len(access_tokens or []),
+            progress_id=progress_id or "",
+        )
+        """对选中账号执行重新登录流程。
 
-        仅对包含 email + password 的账号有效。
+        - email + password: 密码登录（必要时邮箱 OTP 二次验证）
+        - 仅 email: passwordless 邮箱验证码登录
         登录成功后自动将状态设为"正常"。
         """
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
@@ -1578,13 +2792,22 @@ class AccountService:
 
             email = str(account.get("email") or "").strip()
             password = str(account.get("password") or "").strip()
-            if not email or not password:
+            if not email:
                 skipped += 1
                 if progress_id:
-                    self.update_relogin_progress(progress_id, token, "跳过", "无邮箱密码")
+                    self.update_relogin_progress(progress_id, token, "跳过", "无邮箱")
                 continue
 
-            # 在新线程中执行密码重新登录
+            # 有密码走密码登录，仅邮箱走验证码登录
+            self._relogin_trace(
+                "thread_spawn",
+                email=email,
+                method="password" if password else "email_otp",
+                token=anonymize_token(token),
+                mail_inbox=str(account.get("mail_inbox") or ""),
+                mail_provider_ref=str(account.get("mail_provider_ref") or ""),
+                mail_provider_type=str(account.get("mail_provider_type") or ""),
+            )
             t = Thread(
                 target=self._password_re_login_thread,
                 args=(token, email, password, "manual_relogin", progress_id),

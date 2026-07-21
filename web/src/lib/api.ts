@@ -23,6 +23,12 @@ export type Account = {
   status: AccountStatus;
   quota: number;
   email?: string | null;
+  /** OTP 代收箱：邮件实际到达的 CF/中转地址，不等于登录 email 时填写 */
+  mail_inbox?: string | null;
+  /** 绑定的邮箱服务引用，如 cloudflare_temp_email#1；续期 OTP 只走该服务 */
+  mail_provider_ref?: string | null;
+  /** 未绑 ref 时按类型过滤；一般与 ref 二选一 */
+  mail_provider_type?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
     feature_name?: string;
@@ -92,7 +98,17 @@ export type RefreshProgressResponse = {
   status_counts?: Record<string, number>;
   total_quota?: number;
   result?: AccountRefreshResponse | null;
-  results?: Array<{ token: string; status: string; error?: string | null }>;
+  results?: Array<{
+    token: string;
+    status: string;
+    error?: string | null;
+    email?: string;
+    method?: string;
+    expires_at?: number | null;
+    expires_at_text?: string | null;
+    expires_in_seconds?: number | null;
+    detail?: unknown;
+  }>;
 };
 
 type AccountUpdateResponse = {
@@ -448,6 +464,9 @@ export async function updateAccount(
     status?: AccountStatus;
     quota?: number;
     proxy?: string;
+    mail_inbox?: string;
+    mail_provider_ref?: string;
+    mail_provider_type?: string;
   },
 ) {
   return httpRequest<AccountUpdateResponse>("/api/accounts/update", {
