@@ -33,3 +33,11 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+
+# Local debug / scratch scripts
+_bind*.py
+_p.py
+_p2.py
+_verify_*.py
+_verify_*.err
+_verify_*.out

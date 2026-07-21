@@ -1,6 +1,11 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    # Independent deploy: CHATGPT2API_IMAGE=ghcr.io/<your-github-username>/chatgpt2api:latest
+    image: ${CHATGPT2API_IMAGE:-chatgpt2api:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
