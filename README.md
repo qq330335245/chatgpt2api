@@ -20,7 +20,7 @@
 ### Docker 运行
 
 ```bash
-git clone git@github.com:<your-username>/chatgpt2api.git
+git clone git@github.com:qq330335245/chatgpt2api.git
 cd chatgpt2api
 docker compose up -d
 ```
@@ -57,7 +57,7 @@ docker compose -f docker-compose.warp.yml up -d --build
 启动后端：
 
 ```bash
-git clone git@github.com:<your-username>/chatgpt2api.git
+git clone git@github.com:qq330335245/chatgpt2api.git
 cd chatgpt2api
 uv sync
 uv run main.py
@@ -74,7 +74,7 @@ bun run dev
 后续更新新版本：
 
 ```bash
-docker pull ghcr.io/<your-username>/chatgpt2api:latest
+docker pull ghcr.io/qq330335245/chatgpt2api:latest
 docker-compose down
 docker-compose up -d
 

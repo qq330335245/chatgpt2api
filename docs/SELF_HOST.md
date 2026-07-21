@@ -7,8 +7,8 @@
 1. 在 GitHub 新建空仓库（建议私有），例如 `chatgpt2api`。
 2. 不要勾选自动添加 README（本地已有完整代码）。
 3. 记下仓库地址：
-   - HTTPS: `https://github.com/<your-username>/chatgpt2api.git`
-   - SSH: `git@github.com:<your-username>/chatgpt2api.git`
+   - HTTPS: `https://github.com/qq330335245/chatgpt2api.git`
+   - SSH: `git@github.com:qq330335245/chatgpt2api.git`
 
 ## 2. 绑定远程并推送
 
@@ -19,7 +19,7 @@
 
 ```bash
 # 如果还没有设置 origin：
-git remote add origin https://github.com/<your-username>/chatgpt2api.git
+git remote add origin https://github.com/qq330335245/chatgpt2api.git
 
 # 推送主分支与构建工作流
 git push -u origin main
@@ -40,14 +40,14 @@ git push origin v1.6.1
 镜像地址格式：
 
 ```text
-ghcr.io/<your-username>/chatgpt2api:latest
-ghcr.io/<your-username>/chatgpt2api:v1.6.1
+ghcr.io/qq330335245/chatgpt2api:latest
+ghcr.io/qq330335245/chatgpt2api:v1.6.1
 ```
 
 首次拉取私有包时，服务器需要登录 GHCR：
 
 ```bash
-echo <GITHUB_TOKEN> | docker login ghcr.io -u <your-username> --password-stdin
+echo <GITHUB_TOKEN> | docker login ghcr.io -u qq330335245 --password-stdin
 ```
 
 Token 权限至少包含 `read:packages`；若要在网页上可见/管理 package，可能还需要在 GitHub Package 设置里授权仓库读写。
@@ -63,7 +63,7 @@ mkdir -p /opt/chatgpt2api && cd /opt/chatgpt2api
 
 # .env
 cat > .env <<'EOF'
-CHATGPT2API_IMAGE=ghcr.io/<your-username>/chatgpt2api:latest
+CHATGPT2API_IMAGE=ghcr.io/qq330335245/chatgpt2api:latest
 CHATGPT2API_AUTH_KEY=change-me
 EOF
 
