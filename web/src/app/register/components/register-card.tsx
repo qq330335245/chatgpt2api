@@ -59,6 +59,7 @@ export function RegisterCard() {
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
+      ...(type === "mail_2925" ? { main_email: "", main_password: "", imap_host: "imap.2925.com", imap_port: 993, alias_length: 4, alias_segments: 1, fixed_prefix_enabled: false, fixed_prefix: "", message_limit: 40 } : {}),
     });
   };
 
@@ -195,6 +196,7 @@ export function RegisterCard() {
                             <SelectItem value="yyds_mail">yyds_mail</SelectItem>
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
+                            <SelectItem value="mail_2925">mail_2925 (2925.com IMAP 别名)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -329,6 +331,34 @@ export function RegisterCard() {
                               <Input value={String(provider.imap_host || "outlook.office365.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                             </div>
                           ) : null}
+                        </>
+                      ) : null}
+                      {type === "mail_2925" ? (
+                        <>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">主邮箱</label>
+                            <Input value={String(provider.main_email || "")} onChange={(event) => updateProvider(index, { main_email: event.target.value })} placeholder="name@2925.com" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">主邮箱密码</label>
+                            <Input type="password" value={String(provider.main_password || "")} onChange={(event) => updateProvider(index, { main_password: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">IMAP Host</label>
+                            <Input value={String(provider.imap_host || "imap.2925.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">IMAP Port</label>
+                            <Input value={String(provider.imap_port ?? 993)} onChange={(event) => updateProvider(index, { imap_port: Number(event.target.value) || 993 })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">别名后缀长度</label>
+                            <Input value={String(provider.alias_length ?? 4)} onChange={(event) => updateProvider(index, { alias_length: Number(event.target.value) || 4 })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">固定前缀</label>
+                            <Input value={String(provider.fixed_prefix || "")} onChange={(event) => updateProvider(index, { fixed_prefix: event.target.value, fixed_prefix_enabled: Boolean(event.target.value) })} placeholder="fa" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
                         </>
                       ) : null}
                     </div>

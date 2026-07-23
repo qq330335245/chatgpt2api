@@ -1701,6 +1701,496 @@ class OutlookTokenProvider(BaseMailProvider):
         return None
 
 
+
+class Mail2925Provider(BaseMailProvider):
+    """2925.com alias mailboxes via IMAP on the main inbox."""
+
+    name = "mail_2925"
+    domain = "2925.com"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.main_email = str(entry.get("main_email") or "").strip().lower()
+        self.main_password = str(entry.get("main_password") or entry.get("password") or "").strip()
+        self.imap_host = str(entry.get("imap_host") or "imap.2925.com").strip() or "imap.2925.com"
+        try:
+            self.imap_port = int(entry.get("imap_port") or 993)
+        except (TypeError, ValueError):
+            self.imap_port = 993
+        try:
+            self.alias_length = max(4, min(int(entry.get("alias_length") or 10), 24))
+        except (TypeError, ValueError):
+            self.alias_length = 10
+        try:
+            self.alias_segments = max(1, min(int(entry.get("alias_segments") or 1), 4))
+        except (TypeError, ValueError):
+            self.alias_segments = 1
+        raw_prefix_enabled = entry.get("fixed_prefix_enabled")
+        if isinstance(raw_prefix_enabled, str):
+            self.fixed_prefix_enabled = raw_prefix_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            self.fixed_prefix_enabled = bool(raw_prefix_enabled)
+        self.fixed_prefix = str(entry.get("fixed_prefix") or "").strip().lower()
+        try:
+            self.message_limit = max(1, min(int(entry.get("message_limit") or 12), 40))
+        except (TypeError, ValueError):
+            self.message_limit = 30
+        try:
+            self.timeout = max(5, int(entry.get("timeout") or conf.get("request_timeout") or 30))
+        except (TypeError, ValueError):
+            self.timeout = 30
+        local, sep, domain = self.main_email.partition("@")
+        if not self.main_email or not self.main_password:
+            raise RuntimeError("mail_2925 需要 main_email 与 main_password")
+        if not sep or domain != self.domain:
+            raise RuntimeError("mail_2925.main_email 必须是 @2925.com 地址")
+        self.base_local = local
+
+    def _generate_alias_suffix(self) -> str:
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(random.choices(alphabet, k=self.alias_length))
+
+    def _generate_alias_email(self) -> str:
+        prefix = self.fixed_prefix if self.fixed_prefix_enabled else ""
+        suffix = "_".join(self._generate_alias_suffix() for _ in range(self.alias_segments))
+        return f"{self.base_local}{prefix}{suffix}@{self.domain}"
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        address = str(username or "").strip().lower()
+        if address:
+            if "@" not in address:
+                address = f"{address}@{self.domain}"
+            if not address.endswith(f"@{self.domain}"):
+                raise RuntimeError(f"mail_2925 仅支持 @{self.domain} 地址")
+        else:
+            address = self._generate_alias_email()
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "filter_email": address,
+            "inbox_address": self.main_email,
+            "auth_mode": "admin",
+            "token": "imap",
+        }
+
+    def get_existing_mailbox(self, email: str, receive_email: str = "") -> dict[str, Any]:
+        _ = receive_email
+        address = str(email or "").strip().lower()
+        if not address:
+            raise RuntimeError("mail_2925 邮箱地址不能为空")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "filter_email": address,
+            "inbox_address": self.main_email,
+            "auth_mode": "admin",
+            "token": "imap",
+        }
+
+    def _connect(self):
+        return imaplib.IMAP4_SSL(self.imap_host, self.imap_port, timeout=self.timeout)
+
+    @staticmethod
+    def _close(conn) -> None:
+        if not conn:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _decode_header_value(value: str | None) -> str:
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return str(value)
+
+    def _parse_imap_message(self, mailbox: dict[str, Any], raw: bytes) -> dict[str, Any]:
+        message = message_from_bytes(raw, policy=policy.default)
+        try:
+            received = _parse_received_at(parsedate_to_datetime(str(message.get("Date") or "")))
+        except Exception:
+            received = None
+        plain: list[str] = []
+        html: list[str] = []
+        for part in (message.walk() if message.is_multipart() else [message]):
+            if part.get_content_maintype() == "multipart":
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                continue
+            if not payload:
+                continue
+            if part.get_content_type() == "text/html":
+                html.append(str(payload))
+            else:
+                plain.append(str(payload))
+        recipients = [
+            self._decode_header_value(str(message.get(header) or ""))
+            for header in ("To", "Delivered-To", "X-Original-To", "X-Forwarded-To", "Cc")
+        ]
+        return {
+            "provider": self.name,
+            "mailbox": str(mailbox.get("address") or ""),
+            "message_id": self._decode_header_value(str(message.get("Message-ID") or "")),
+            "subject": self._decode_header_value(str(message.get("Subject") or "")),
+            "sender": self._decode_header_value(str(message.get("From") or "")),
+            "text_content": "\n".join(plain).strip(),
+            "html_content": "\n".join(html).strip(),
+            "received_at": received,
+            "recipients": [item for item in recipients if item],
+            "raw": None,
+        }
+
+    @staticmethod
+    def _normalize_address(value: str) -> str:
+        text = str(value or "").strip().lower()
+        match = re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text)
+        return match.group(0) if match else text
+
+    def _message_targets_alias(self, message: dict[str, Any], alias_email: str) -> bool:
+        target = self._normalize_address(alias_email)
+        if not target:
+            return True
+        recipients = message.get("recipients") if isinstance(message.get("recipients"), list) else []
+        for item in recipients:
+            if target == self._normalize_address(str(item)):
+                return True
+            if target in str(item).lower():
+                return True
+        blob = "\n".join(
+            str(message.get(key) or "")
+            for key in ("subject", "text_content", "html_content", "sender")
+        ).lower()
+        return target in blob
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        alias = str(mailbox.get("filter_email") or mailbox.get("address") or "").strip().lower()
+        conn = None
+        try:
+            conn = self._connect()
+            status, _ = conn.login(self.main_email, self.main_password)
+            if status != "OK":
+                raise RuntimeError(f"mail_2925 IMAP 登录失败: {status}")
+            status, select_data = conn.select("INBOX", readonly=True)
+            if status != "OK":
+                raise RuntimeError("mail_2925 IMAP select INBOX 失败")
+            mailbox_count = 0
+            if select_data:
+                first = select_data[0] if isinstance(select_data, (list, tuple)) else select_data
+                count_text = first.decode("utf-8", errors="ignore") if isinstance(first, bytes) else str(first or "")
+                try:
+                    mailbox_count = max(int(count_text.strip()), 0)
+                except Exception:
+                    mailbox_count = 0
+            if mailbox_count <= 0:
+                return []
+
+            start_idx = max(mailbox_count - self.message_limit + 1, 1)
+            # Fetch newest-first via reverse sequence numbers.
+            seq_ids = [str(i).encode("ascii") for i in range(mailbox_count, start_idx - 1, -1)]
+            messages: list[dict[str, Any]] = []
+            for msg_id in seq_ids:
+                try:
+                    fetch_status, fetch_data = conn.fetch(msg_id, "(RFC822)")
+                    if fetch_status != "OK" or not fetch_data:
+                        continue
+                    raw = next((part[1] for part in fetch_data if isinstance(part, tuple) and isinstance(part[1], bytes)), b"")
+                    if not raw:
+                        continue
+                    parsed = self._parse_imap_message(mailbox, raw)
+                    if alias and not self._message_targets_alias(parsed, alias):
+                        continue
+                    messages.append(parsed)
+                    if alias and len(messages) >= 3:
+                        break
+                except Exception:
+                    continue
+            return messages
+        finally:
+            self._close(conn)
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        """轮询时遍历最近 N 封邮件，逐封提取验证码，避免最新一封是广告/安全提醒时错过验证码。"""
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            for message in self.fetch_recent_messages(mailbox):
+                if _message_before_code_boundary(mailbox, message):
+                    continue
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    return code
+                seen_refs.add(ref)
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
+
+
+
+class Mail2925Provider(BaseMailProvider):
+    """2925.com alias mailboxes via IMAP on the main inbox."""
+
+    name = "mail_2925"
+    domain = "2925.com"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.main_email = str(entry.get("main_email") or "").strip().lower()
+        self.main_password = str(entry.get("main_password") or entry.get("password") or "").strip()
+        self.imap_host = str(entry.get("imap_host") or "imap.2925.com").strip() or "imap.2925.com"
+        try:
+            self.imap_port = int(entry.get("imap_port") or 993)
+        except (TypeError, ValueError):
+            self.imap_port = 993
+        try:
+            self.alias_length = max(4, min(int(entry.get("alias_length") or 10), 24))
+        except (TypeError, ValueError):
+            self.alias_length = 10
+        try:
+            self.alias_segments = max(1, min(int(entry.get("alias_segments") or 1), 4))
+        except (TypeError, ValueError):
+            self.alias_segments = 1
+        raw_prefix_enabled = entry.get("fixed_prefix_enabled")
+        if isinstance(raw_prefix_enabled, str):
+            self.fixed_prefix_enabled = raw_prefix_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            self.fixed_prefix_enabled = bool(raw_prefix_enabled)
+        self.fixed_prefix = str(entry.get("fixed_prefix") or "").strip().lower()
+        try:
+            self.message_limit = max(1, min(int(entry.get("message_limit") or 15), 50))
+        except (TypeError, ValueError):
+            self.message_limit = 30
+        try:
+            self.timeout = max(5, int(entry.get("timeout") or conf.get("request_timeout") or 30))
+        except (TypeError, ValueError):
+            self.timeout = 30
+        local, sep, domain = self.main_email.partition("@")
+        if not self.main_email or not self.main_password:
+            raise RuntimeError("mail_2925 需要 main_email 与 main_password")
+        if not sep or domain != self.domain:
+            raise RuntimeError("mail_2925.main_email 必须是 @2925.com 地址")
+        self.base_local = local
+
+    def _generate_alias_suffix(self) -> str:
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(random.choices(alphabet, k=self.alias_length))
+
+    def _generate_alias_email(self) -> str:
+        prefix = self.fixed_prefix if self.fixed_prefix_enabled else ""
+        suffix = "_".join(self._generate_alias_suffix() for _ in range(self.alias_segments))
+        return f"{self.base_local}{prefix}{suffix}@{self.domain}"
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        address = str(username or "").strip().lower()
+        if address:
+            if "@" not in address:
+                address = f"{address}@{self.domain}"
+            if not address.endswith(f"@{self.domain}"):
+                raise RuntimeError(f"mail_2925 仅支持 @{self.domain} 地址")
+        else:
+            address = self._generate_alias_email()
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "filter_email": address,
+            "inbox_address": self.main_email,
+            "auth_mode": "admin",
+            "token": "imap",
+        }
+
+    def get_existing_mailbox(self, email: str, receive_email: str = "") -> dict[str, Any]:
+        _ = receive_email
+        address = str(email or "").strip().lower()
+        if not address:
+            raise RuntimeError("mail_2925 邮箱地址不能为空")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "filter_email": address,
+            "inbox_address": self.main_email,
+            "auth_mode": "admin",
+            "token": "imap",
+        }
+
+    def _connect(self):
+        return imaplib.IMAP4_SSL(self.imap_host, self.imap_port, timeout=self.timeout)
+
+    @staticmethod
+    def _close(conn) -> None:
+        if not conn:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _decode_header_value(value: str | None) -> str:
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return str(value)
+
+    def _parse_imap_message(self, mailbox: dict[str, Any], raw: bytes) -> dict[str, Any]:
+        message = message_from_bytes(raw, policy=policy.default)
+        try:
+            received = _parse_received_at(parsedate_to_datetime(str(message.get("Date") or "")))
+        except Exception:
+            received = None
+        plain: list[str] = []
+        html: list[str] = []
+        for part in (message.walk() if message.is_multipart() else [message]):
+            if part.get_content_maintype() == "multipart":
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                continue
+            if not payload:
+                continue
+            if part.get_content_type() == "text/html":
+                html.append(str(payload))
+            else:
+                plain.append(str(payload))
+        recipients = [
+            self._decode_header_value(str(message.get(header) or ""))
+            for header in ("To", "Delivered-To", "X-Original-To", "X-Forwarded-To", "Cc")
+        ]
+        return {
+            "provider": self.name,
+            "mailbox": str(mailbox.get("address") or ""),
+            "message_id": self._decode_header_value(str(message.get("Message-ID") or "")),
+            "subject": self._decode_header_value(str(message.get("Subject") or "")),
+            "sender": self._decode_header_value(str(message.get("From") or "")),
+            "text_content": "\n".join(plain).strip(),
+            "html_content": "\n".join(html).strip(),
+            "received_at": received,
+            "recipients": [item for item in recipients if item],
+            "raw": None,
+        }
+
+    @staticmethod
+    def _normalize_address(value: str) -> str:
+        text = str(value or "").strip().lower()
+        match = re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text)
+        return match.group(0) if match else text
+
+    def _message_targets_alias(self, message: dict[str, Any], alias_email: str) -> bool:
+        target = self._normalize_address(alias_email)
+        if not target:
+            return True
+        recipients = message.get("recipients") if isinstance(message.get("recipients"), list) else []
+        for item in recipients:
+            if target == self._normalize_address(str(item)):
+                return True
+            if target in str(item).lower():
+                return True
+        blob = "\n".join(
+            str(message.get(key) or "")
+            for key in ("subject", "text_content", "html_content", "sender")
+        ).lower()
+        return target in blob
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        alias = str(mailbox.get("filter_email") or mailbox.get("address") or "").strip().lower()
+        conn = None
+        try:
+            conn = self._connect()
+            status, _ = conn.login(self.main_email, self.main_password)
+            if status != "OK":
+                raise RuntimeError(f"mail_2925 IMAP 登录失败: {status}")
+            status, select_data = conn.select("INBOX", readonly=True)
+            if status != "OK":
+                raise RuntimeError("mail_2925 IMAP select INBOX 失败")
+            mailbox_count = 0
+            if select_data:
+                first = select_data[0] if isinstance(select_data, (list, tuple)) else select_data
+                count_text = first.decode("utf-8", errors="ignore") if isinstance(first, bytes) else str(first or "")
+                try:
+                    mailbox_count = max(int(count_text.strip()), 0)
+                except Exception:
+                    mailbox_count = 0
+            if mailbox_count <= 0:
+                return []
+
+            # Prefer sequence numbers of newest N mails; avoid SEARCH ALL on large inboxes.
+            start = max(mailbox_count - self.message_limit + 1, 1)
+            seq_ids = [str(i).encode("ascii") for i in range(mailbox_count, start - 1, -1)]
+
+            messages: list[dict[str, Any]] = []
+            for msg_id in seq_ids:
+                try:
+                    # Header-only first for recipient filter.
+                    header_status, header_data = conn.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (FROM TO CC DELIVERED-TO X-ORIGINAL-TO X-FORWARDED-TO SUBJECT DATE MESSAGE-ID)])")
+                    if header_status != "OK" or not header_data:
+                        continue
+                    header_raw = next((part[1] for part in header_data if isinstance(part, tuple) and isinstance(part[1], bytes)), b"")
+                    if not header_raw:
+                        continue
+                    header_msg = self._parse_imap_message(mailbox, header_raw)
+                    if alias and not self._message_targets_alias(header_msg, alias):
+                        continue
+                    body_status, body_data = conn.fetch(msg_id, "(RFC822)")
+                    if body_status != "OK" or not body_data:
+                        continue
+                    raw = next((part[1] for part in body_data if isinstance(part, tuple) and isinstance(part[1], bytes)), b"")
+                    if not raw:
+                        continue
+                    messages.append(self._parse_imap_message(mailbox, raw))
+                    # OTP wait only needs the newest match.
+                    if alias and len(messages) >= 3:
+                        break
+                except Exception:
+                    continue
+            return messages
+        finally:
+            self._close(conn)
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        if not messages:
+            return None
+        return max(
+            messages,
+            key=lambda item: (
+                (item.get("received_at") or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
+                str(item.get("message_id") or ""),
+            ),
+        )
+
+
+
 def _entries(mail_config: dict) -> list[dict]:
     result: list[dict] = []
     counters: dict[str, int] = {}
@@ -1756,6 +2246,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
+    if entry["type"] == "mail_2925":
+        return Mail2925Provider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

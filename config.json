@@ -11,7 +11,7 @@
     "info",
     "warning"
   ],
-  "proxy": "",
+  "proxy": "http://192.168.15.144:7890",
   "proxy_runtime": {
     "enabled": false,
     "egress_mode": "single_proxy",
@@ -34,7 +34,7 @@
       "warm_up_on_start": true
     }
   },
-  "base_url": "",
+  "base_url": "http://127.0.0.1:3000",
   "sensitive_words": [],
   "global_system_prompt": "",
   "ai_review": {
