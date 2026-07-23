@@ -137,6 +137,126 @@ environment:
 - 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
 
+### 批量重新登录与 Agent Identity（CLI）
+
+用于从邮箱列表批量 OTP/密码重新登录，导出 **ChatGPT Web session** 凭证（含 `access_token` / `id_token` / `session_token` 等），并可进一步用 [freeAgentIdentity](https://github.com/asz798838958/freeAgentIdentity) 导出 Agent Identity。
+
+> 说明：当前 CLI 续期以 **ChatGPT 官网入口纯协议** 为主（homepage → csrf → signin → authorize）。  
+> 若账号未完成资料页（`about-you`），会返回 `unexpected_about_you`，需先补全资料或等待后续自动 about-you 支持。  
+> Agent Identity 需要 token 中带 `chatgpt_account_id` 等 claims；优先使用 Web session 凭证，纯 Platform/Codex OAuth 往往不够。
+
+#### 1. 配置邮箱服务
+
+在 `data/mail_providers.json` 配置 CF Temp Mail / 2925 / iCloud 等（该文件可含密钥，请勿提交到 Git）：
+
+```json
+{
+  "providers": [
+    {
+      "provider_ref": "cf1",
+      "type": "cloudflare_temp_email",
+      "enable": true,
+      "api_base": "https://your-cloudmail-worker.example",
+      "admin_password": "your-admin-password",
+      "domain": ["example.fhbsfg.buzz"],
+      "inbox_address": "catch-all@example.com"
+    }
+  ],
+  "wait_timeout": 120,
+  "wait_interval": 2,
+  "request_timeout": 30,
+  "api_use_register_proxy": true
+}
+```
+
+也可沿用 `data/register.json` 的 `mail` 段；`relogin_tokens.py` / 续期逻辑会优先读取 `data/mail_providers.json`（若存在）。
+
+#### 2. 从邮箱列表生成账号 JSON
+
+```bash
+# 一行一个邮箱（支持 email----password / email,password 取邮箱部分）
+python scripts/generate_relogin_accounts.py emails.txt -o data/relogin_accounts.json
+python scripts/generate_relogin_accounts.py emails.txt --icloud-inbox apple@konsin.net
+```
+
+识别规则：
+
+| 后缀 | provider | 模式 |
+|------|----------|------|
+| `@2925.com` | `mail_2925` | `alias_imap`（主箱读信 + 按别名过滤） |
+| `@icloud.com` | `icloud` | `catch_all`（默认收件箱见 `--icloud-inbox`） |
+| 其他 | `cf_temp_mail` | `direct`（CF 本地域名直收；若只是转发别名可改为 `catch_all` + `inbox`） |
+
+生成示例（结构）：
+
+```json
+{
+  "defaults": { "mail": { "provider": "cf_temp_mail" } },
+  "accounts": [
+    {
+      "email": "user@example.com",
+      "password": "",
+      "mail": {
+        "provider": "cf_temp_mail",
+        "mode": "direct",
+        "filter_to": "user@example.com"
+      }
+    }
+  ]
+}
+```
+
+有密码可填 `password`；无密码走邮箱 OTP。
+
+#### 3. 批量重新登录
+
+```bash
+# 建议先并发 1，避免 CF / auth 限流
+python scripts/relogin_tokens.py \
+  --accounts data/relogin_accounts.json \
+  --out-dir data/relogin_out \
+  --concurrency 1
+
+# 显式指定邮箱配置
+python scripts/relogin_tokens.py \
+  --accounts data/relogin_accounts.json \
+  --mail-config data/mail_providers.json \
+  --out-dir data/relogin_out \
+  --concurrency 1 \
+  --skip-existing
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--accounts` | 账号 JSON（必填） |
+| `--out-dir` | 输出目录，默认 `data/relogin_out`；每个成功号写 `邮箱.json` |
+| `--mail-config` | 邮箱配置 JSON；默认 `data/mail_providers.json` |
+| `--concurrency` | 并发数，默认 `1` |
+| `--import-pool` | 成功后写入 chatgpt2api 号池 |
+| `--limit N` | 只处理前 N 个 |
+| `--skip-existing` | 输出已存在则跳过 |
+
+成功日志示例：`[ok] user@example.com ... session_token=yes`  
+常见失败：`account_deactivated`（号已停用）、`otp_timeout`（未收到验证码）、`unexpected_about_you`（卡在资料页）。
+
+#### 4. 导出 Agent Identity（可选）
+
+依赖独立项目 freeAgentIdentity（需安装其依赖 / venv）：
+
+```bash
+# 单文件 → 同目录 <文件名>_agent.json
+python /path/to/freeAgentIdentity/scripts/export_agent_identity.py data/relogin_out/user@example.com.json
+
+# 目录 → 同级 <目录名>_agent/，内为各 <原名>_agent.json
+python /path/to/freeAgentIdentity/scripts/export_agent_identity.py data/relogin_out
+python /path/to/freeAgentIdentity/scripts/export_agent_identity.py data/relogin_out --proxy http://127.0.0.1:7890
+```
+
+输入 JSON 至少需要 `access_token`；有 `id_token` 更稳妥。  
+若 JWT 缺少 `chatgpt_account_id`，脚本会尝试用 `account_id` 字段或 ChatGPT `/backend-api/me` 补全（可能失败）。
+
 ### 实验性 / 规划中
 
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)

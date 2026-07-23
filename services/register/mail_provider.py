@@ -369,16 +369,32 @@ def _extract_code(message: dict[str, Any]) -> str | None:
     content = f"{message.get('subject', '')}\n{message.get('text_content', '')}\n{message.get('html_content', '')}".strip()
     if not content:
         return None
+    invalid = {"000000", "111111", "123456", "177010"}
+
+    def _ok(code: str | None) -> str | None:
+        value = str(code or "").strip()
+        if len(value) == 6 and value.isdigit() and value not in invalid:
+            return value
+        return None
+
     match = re.search(r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>", content, re.I)
     if match:
-        return match.group(1)
-    match = re.search(r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})", content, re.I)
-    if match and match.group(1) != "177010":
-        return match.group(1)
+        hit = _ok(match.group(1))
+        if hit:
+            return hit
+    match = re.search(
+        r"(?:Verification code|login code|code is|临时验证码|登录代码|代码为|验证码)[:\s]*(\d{6})",
+        content,
+        re.I,
+    )
+    if match:
+        hit = _ok(match.group(1))
+        if hit:
+            return hit
     for code in re.findall(r">\s*(\d{6})\s*<|(?<![#&])\b(\d{6})\b", content):
-        value = code[0] or code[1]
-        if value and value != "177010":
-            return value
+        hit = _ok(code[0] or code[1])
+        if hit:
+            return hit
     return None
 
 
@@ -654,23 +670,30 @@ class CloudflareTempMailProvider(BaseMailProvider):
         }
 
     def _pick_matching_mail(self, items: list[dict[str, Any]], filter_email: str, mailbox: dict[str, Any]) -> dict[str, Any] | None:
-        """优先匹配登录别名；其次匹配 CF 代收箱地址（转发信 to 常是 catch-all）。"""
+        """优先匹配登录别名；仅在无 filter 时才用 inbox / 列表首封兜底。
+
+        注意：catch-all 代收箱（如 apple@...）里有大量无关邮件。若已指定
+        filter_email（登录别名），绝不能把 inbox 的第一封无关信当成命中，
+        否则会抽出假验证码或导致一直等不到真 OTP。
+        """
         inbox = str(mailbox.get("inbox_address") or "").strip()
-        # 1) 登录别名精确命中
+        filter_email = str(filter_email or "").strip()
+        # 1) 登录别名命中（address/to/raw 中含 alias）
         if filter_email:
             for item in items:
                 if isinstance(item, dict) and _message_matches_email(item, filter_email):
                     return self._message_from_item(item, filter_email, mailbox)
-        # 2) 代收箱命中（iCloud Hide My Email 转发后 address 多为 inbox）
+            # 已指定别名但本批列表无一命中 → 交给调用方换 address 再查
+            return None
+        # 2) 无 filter：按代收箱命中
         if inbox:
             for item in items:
                 if isinstance(item, dict) and _message_matches_email(item, inbox):
-                    return self._message_from_item(item, filter_email or inbox, mailbox)
-        # 3) 已按 address=inbox 拉列表时，列表本身即该箱邮件，取第一封可用
-        if items and (not filter_email or (inbox and filter_email.lower() != inbox.lower())):
-            for item in items:
-                if isinstance(item, dict):
-                    return self._message_from_item(item, filter_email or inbox, mailbox)
+                    return self._message_from_item(item, inbox, mailbox)
+        # 3) 无 filter 且列表非空：取第一封
+        for item in items:
+            if isinstance(item, dict):
+                return self._message_from_item(item, inbox, mailbox)
         return None
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
@@ -695,25 +718,27 @@ class CloudflareTempMailProvider(BaseMailProvider):
             except Exception:
                 pass
 
-        # B) admin 直读指定收件地址（apple2@...）
+        # B) admin 直读：对齐 codex-console — 先按登录别名 address 查，再查代收箱，最后不过滤
         if self.admin_password:
             last_error = ""
-            for address in dict.fromkeys([inbox_address, filter_email, ""]):
+            # 关键：filter_email（登录邮箱）优先；inbox 次之。绝不能先查大代收箱再“随便取一封”。
+            query_addresses: list[str] = []
+            for addr in (filter_email, inbox_address, ""):
+                a = str(addr or "").strip()
+                if a not in query_addresses:
+                    query_addresses.append(a)
+            for address in query_addresses:
                 try:
                     items = self._admin_list_mails(address=address, limit=30)
                 except Exception as exc:
                     last_error = str(exc)
                     continue
-                # address 过滤可能把转发信漏掉：先按 alias 匹配，再按 inbox
+                if not items:
+                    continue
+                # 已按 address=filter 拉列表时，列表本身即目标箱；仍用 filter 做客户端二次确认
                 hit = self._pick_matching_mail(items, filter_email, mailbox)
                 if hit:
                     return hit
-                if filter_email and filter_email.lower() != inbox_address.lower():
-                    hit = self._pick_matching_mail(items, inbox_address, mailbox)
-                    if hit:
-                        # 仍挂到 alias 上，方便日志
-                        hit["mailbox"] = filter_email
-                        return hit
             if last_error and auth_mode == "admin":
                 raise RuntimeError(last_error)
 
@@ -2199,8 +2224,12 @@ def _entries(mail_config: dict) -> list[dict]:
         t = item.get("type", "")
         cnt = counters.get(t, 0) + 1
         counters[t] = cnt
-        label = f"DDG-{cnt}" if t == "ddg_mail" else f"{t}#{idx}"
-        result.append({**item, "provider_ref": f"{item['type']}#{idx}", "label": label})
+        explicit_ref = str(item.get("provider_ref") or "").strip()
+        auto_ref = f"{item['type']}#{idx}"
+        ref = explicit_ref or auto_ref
+        default_label = f"DDG-{cnt}" if t == "ddg_mail" else auto_ref
+        label = str(item.get("label") or "").strip() or default_label
+        result.append({**item, "provider_ref": ref, "label": label})
     return result
 
 
@@ -2357,11 +2386,33 @@ def get_existing_mailbox(
     if not all_entries:
         raise RuntimeError("未配置 mail.providers，请先在注册设置中配置邮箱服务")
 
+    # normalize common aliases used by generate_relogin_accounts / UI
+    type_aliases = {
+        "cf": "cloudflare_temp_email",
+        "cf_temp_mail": "cloudflare_temp_email",
+        "cloudflare": "cloudflare_temp_email",
+        "cloudflare_temp_mail": "cloudflare_temp_email",
+        "2925": "mail_2925",
+        "mail2925": "mail_2925",
+        "icloud_hme": "icloud",
+        "apple": "icloud",
+    }
+    if ptype:
+        ptype = type_aliases.get(ptype.lower(), ptype)
+
     candidates: list[dict] = []
     if ref:
         candidates = [item for item in all_entries if str(item.get("provider_ref") or "") == ref]
         if not candidates:
-            raise RuntimeError(f"账号绑定的邮箱服务不存在: {ref}")
+            # legacy auto-ref type#N may not match when config order differs; fall back by type
+            if ptype:
+                candidates = [item for item in all_entries if str(item.get("type") or "") == ptype]
+            if not candidates and "#" in ref:
+                maybe_type = ref.split("#", 1)[0].strip()
+                maybe_type = type_aliases.get(maybe_type.lower(), maybe_type)
+                candidates = [item for item in all_entries if str(item.get("type") or "") == maybe_type]
+            if not candidates:
+                raise RuntimeError(f"账号绑定的邮箱服务不存在: {ref}")
     else:
         # 未绑 ref：显式 type 优先；否则默认 Cloudflare Temp Mail，免逐账号配置
         if not ptype:

@@ -773,6 +773,19 @@ class AccountService:
         except Exception:
             pass
 
+        # Prefer dedicated mail_providers.json (same source as scripts/relogin_tokens.py).
+        # register.json often keeps CF disabled while mail_providers.json has production CF/2925/iCloud.
+        try:
+            mp_path = DATA_DIR / "mail_providers.json"
+            if mp_path.is_file():
+                mp_raw = json.loads(mp_path.read_text(encoding="utf-8"))
+                if isinstance(mp_raw, dict):
+                    mp_mail = mp_raw.get("mail") if isinstance(mp_raw.get("mail"), dict) else mp_raw
+                    if isinstance(mp_mail, dict) and isinstance(mp_mail.get("providers"), list) and mp_mail.get("providers"):
+                        mail = {**mail, **mp_mail}
+        except Exception:
+            pass
+
         try:
             mail["wait_timeout"] = max(float(mail.get("wait_timeout") or 30), 90.0)
         except Exception:
@@ -1064,21 +1077,44 @@ class AccountService:
                     return result
                 last_detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
                 page = last_detail.get("page") if isinstance(last_detail.get("page"), dict) else {}
+                is_about_you = (
+                    "about-you" in str(last_detail.get("continue_url") or "")
+                    or str(page.get("type") or "") == "about_you"
+                )
                 self._relogin_trace(
                     "otp_validate_ok_no_auth_code",
                     email=email,
                     code=code,
                     continue_url=str(last_detail.get("continue_url") or ""),
                     page_type=str(page.get("type") or ""),
-                    about_you=(
-                        "about-you" in str(last_detail.get("continue_url") or "")
-                        or str(page.get("type") or "") == "about_you"
-                    ),
+                    about_you=is_about_you,
                     detail=last_detail,
                 )
+                # about-you means incomplete profile / re-onboarding; stop OTP loop
+                if is_about_you:
+                    return {
+                        "ok": False,
+                        "error": "unexpected_about_you",
+                        "detail": last_detail or {"email": email, "code": code},
+                    }
                 continue
             last_detail = result.get("detail") if isinstance(result.get("detail"), dict) else {"error": result.get("error")}
             detail_text = json.dumps(last_detail, ensure_ascii=False).lower()
+            # permanent account states: stop waiting for more OTPs
+            err_obj = last_detail.get("error") if isinstance(last_detail.get("error"), dict) else {}
+            err_code = str(err_obj.get("code") or "").strip().lower()
+            if err_code in {"account_deactivated", "account_deleted", "user_banned", "account_banned"} or "account_deactivated" in detail_text or "has been deleted or deactivated" in detail_text:
+                self._relogin_trace(
+                    "otp_account_deactivated",
+                    email=email,
+                    code=code,
+                    last=last_detail,
+                )
+                return {
+                    "ok": False,
+                    "error": "account_deactivated",
+                    "detail": {"email": email, "code": code, "last": last_detail},
+                }
             if "max_check_attempts" in detail_text or "too many tries" in detail_text:
                 self._relogin_trace(
                     "otp_max_check_attempts",
@@ -1652,7 +1688,17 @@ class AccountService:
                     error=err,
                     detail=otp_result.get("detail"),
                 )
-                if err in {"otp_max_check_attempts", "rate_limit_exceeded", "otp_mail_unavailable"}:
+                if err in {
+                    "otp_max_check_attempts",
+                    "rate_limit_exceeded",
+                    "otp_mail_unavailable",
+                    "account_deactivated",
+                    "account_deleted",
+                    "user_banned",
+                    "account_banned",
+                    "unexpected_about_you",
+                    "otp_no_auth_code",
+                }:
                     return otp_result
                 # 首轮未发出/漏信时再补一次通用 send
                 self._relogin_trace("email_otp_resend_email_otp", email=email)
