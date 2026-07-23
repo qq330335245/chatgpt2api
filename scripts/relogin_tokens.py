@@ -174,7 +174,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="批量重新登录并导出 ChatGPT session 凭证")
     parser.add_argument("--accounts", required=True, type=Path, help="账号 JSON 文件")
     parser.add_argument("--out-dir", type=Path, default=None, help="输出目录，默认 data/relogin_out")
-    parser.add_argument("--mail-config", type=Path, default=None, help="可选 mail providers JSON 覆盖")
+    parser.add_argument(
+        "--mail-config",
+        type=Path,
+        default=None,
+        help="mail providers JSON（默认 data/mail_providers.json，不存在则用 register.json）",
+    )
     parser.add_argument("--concurrency", type=int, default=1, help="并发数，默认 1")
     parser.add_argument("--import-pool", action="store_true", help="成功后写入 chatgpt2api 号池")
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 个账号，0=全部")
@@ -197,10 +202,16 @@ def main(argv: list[str] | None = None) -> int:
     from services.register.mail_gateway import MailGateway
 
     override = None
-    if args.mail_config:
-        mc = _load_json(args.mail_config.expanduser().resolve())
+    mail_cfg_path = args.mail_config
+    if mail_cfg_path is None:
+        default_mail = ROOT / "data" / "mail_providers.json"
+        if default_mail.is_file():
+            mail_cfg_path = default_mail
+    if mail_cfg_path:
+        mc = _load_json(mail_cfg_path.expanduser().resolve())
         if isinstance(mc, dict):
             override = mc.get("mail") if isinstance(mc.get("mail"), dict) else mc
+        print(f"mail-config={mail_cfg_path}", flush=True)
     gateway = MailGateway.from_register_json(override=override)
 
     out_dir = (args.out_dir or (ROOT / "data" / "relogin_out")).expanduser().resolve()
