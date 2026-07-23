@@ -1,0 +1,43 @@
+{
+  "defaults": {
+    "mail": {
+      "provider": "cf_temp_mail"
+    }
+  },
+  "accounts": [
+    {
+      "email": "user1@example.fhbsfg.buzz",
+      "password": "",
+      "mail": {
+        "provider": "cf_temp_mail",
+        "mode": "direct"
+      }
+    },
+    {
+      "email": "lurenjia113faxxxx@2925.com",
+      "password": "",
+      "mail": {
+        "provider": "mail_2925"
+      }
+    },
+    {
+      "email": "alias@privaterelay.appleid.com",
+      "password": "",
+      "mail": {
+        "provider": "icloud",
+        "mode": "alias_imap",
+        "inbox": "your_shared@icloud.com",
+        "filter_to": "alias@privaterelay.appleid.com"
+      }
+    },
+    {
+      "email": "forwarded-alias@example.com",
+      "mail": {
+        "provider": "cf_temp_mail",
+        "mode": "catch_all",
+        "inbox": "catch@your-cf-domain.com",
+        "filter_to": "forwarded-alias@example.com"
+      }
+    }
+  ]
+}

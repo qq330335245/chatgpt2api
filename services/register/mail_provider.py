@@ -2226,6 +2226,9 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
     entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
     conf = _config(mail_config)
+    # keep full config for nested providers (e.g. icloud -> cf forward)
+    entry = dict(entry)
+    entry["_mail_config"] = mail_config
     if entry["type"] == "cloudmail_gen":
         return CloudMailGenProvider(entry, conf)
     if entry["type"] == "cloudflare_temp_email":
@@ -2248,6 +2251,9 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return OutlookTokenProvider(entry, conf)
     if entry["type"] == "mail_2925":
         return Mail2925Provider(entry, conf)
+    if entry["type"] in {"icloud", "icloud_hme", "apple"}:
+        from services.register.icloud_mail import ICloudMailProvider
+        return ICloudMailProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

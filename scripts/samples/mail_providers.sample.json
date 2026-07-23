@@ -1,0 +1,47 @@
+{
+  "providers": [
+    {
+      "provider_ref": "cf1",
+      "type": "cloudflare_temp_email",
+      "enable": true,
+      "label": "CF Temp Mail",
+      "api_base": "https://your-worker.example.com",
+      "admin_password": "YOUR_ADMIN_PASSWORD",
+      "domain": ["your-domain.com"],
+      "inbox_address": "catch@your-domain.com"
+    },
+    {
+      "provider_ref": "m2925",
+      "type": "mail_2925",
+      "enable": true,
+      "label": "2925",
+      "main_email": "name@2925.com",
+      "main_password": "YOUR_PASSWORD",
+      "imap_host": "imap.2925.com",
+      "imap_port": 993
+    },
+    {
+      "provider_ref": "icloud1",
+      "type": "icloud",
+      "enable": true,
+      "label": "iCloud IMAP",
+      "connection_mode": "imap",
+      "shared_email": "you@icloud.com",
+      "shared_password": "app-specific-password"
+    },
+    {
+      "provider_ref": "icloud_cf",
+      "type": "icloud",
+      "enable": false,
+      "label": "iCloud via CF forward",
+      "connection_mode": "temp_mail",
+      "temp_mail_type": "cloudflare_temp_email",
+      "temp_mail_provider_ref": "cf1",
+      "temp_mail_target_email": "catch@your-domain.com"
+    }
+  ],
+  "wait_timeout": 120,
+  "wait_interval": 2,
+  "request_timeout": 30,
+  "api_use_register_proxy": true
+}
