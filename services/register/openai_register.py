@@ -19,6 +19,11 @@ from curl_cffi import requests
 from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+from services.register.chatgpt_web_entry import (
+    ChatGPTWebEntry,
+    fetch_chatgpt_web_session,
+    _is_cf_challenge as _entry_is_cf,
+)
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -42,10 +47,14 @@ except Exception:
 
 auth_base = "https://auth.openai.com"
 platform_base = "https://platform.openai.com"
+chatgpt_base = "https://chatgpt.com"
+# Platform OAuth client (cold authorize; easier to hit Cloudflare)
 platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+# ChatGPT Web client (used by codex-console homepage entry; lower CF rate)
+chatgpt_oauth_client_id = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -199,16 +208,30 @@ def _is_cloudflare_challenge(resp) -> bool:
         status_code = int(getattr(resp, "status_code", 0) or 0)
     except (TypeError, ValueError):
         status_code = 0
-    if status_code not in (403, 503):
-        return False
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        header_map = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+    except Exception:
+        header_map = {}
     text = str(getattr(resp, "text", "") or "").lower()
-    return (
-        "<title>just a moment" in text
-        or "<title>attention required! | cloudflare" in text
+    has_cf_marker = (
+        "just a moment" in text
+        or "attention required" in text
         or "cf-chl-" in text
         or "__cf_chl_" in text
         or "cf-browser-verification" in text
+        or "challenges.cloudflare.com" in text
+        or bool(header_map.get("cf-ray"))
+        or "cloudflare" in header_map.get("server", "").lower()
     )
+    if status_code in (403, 503) and has_cf_marker:
+        return True
+    # 部分情况下 200 但 body 仍是 challenge 壳
+    if status_code == 200 and (
+        "<title>just a moment" in text or "cf-browser-verification" in text
+    ):
+        return True
+    return False
 
 
 def _truthy(value: object, fallback: bool = True) -> bool:
@@ -318,7 +341,8 @@ def create_session(proxy: str = "") -> Any:
     kwargs = proxy_settings.build_session_kwargs(
         proxy=proxy,
         upstream=True,
-        impersonate="chrome",
+        # default; ChatGPT 官网入口成功后会用 entry 的一致指纹会话替换
+        impersonate="chrome131",
         verify=False,
     )
     return requests.Session(**kwargs)
@@ -448,6 +472,8 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.entry_mode = "platform"  # chatgpt_web | platform
+        self.continue_url = ""
 
     def close(self) -> None:
         self.session.close()
@@ -489,6 +515,66 @@ class PlatformRegistrar:
             self.clearance_failure_reason = "clearance 刷新未返回可用 Cookie，请检查 FlareSolverr URL、代理和出口 IP"
             step(index, f"Cloudflare clearance 刷新失败：{self.clearance_failure_reason}", "yellow")
         return bundle
+
+
+    def _authorize_bootstrap(self, email: str, index: int) -> None:
+        """纯协议 ChatGPT 官网入口 authorize（对齐 codex-console / freeAgentIdentity）。
+
+        不再优先冷启动 platform authorize（app_2SKx67...），那是 CF 重灾区。
+        不使用浏览器接管；CF 失败直接报错并提示换代理。
+        """
+        def _log(msg: str) -> None:
+            if "官网入口完成" in msg or "失败" in msg or "CF" in msg or "Cloudflare" in msg:
+                step(index, msg)
+
+        entry = ChatGPTWebEntry(
+            email,
+            proxy=self.proxy,
+            log=_log,
+            timeout=default_timeout,
+            verbose=False,
+            screen_hint="signup",
+        )
+        try:
+            result = entry.execute()
+        except Exception as exc:
+            entry.close()
+            raise RuntimeError(f"ChatGPT 官网入口异常: {exc}") from exc
+
+        if not result.success:
+            # keep entry session closed to avoid leaks
+            try:
+                entry.close()
+            except Exception:
+                pass
+            err = result.error or "unknown"
+            raise RuntimeError(
+                f"ChatGPT 官网入口失败: {err}。"
+                "这是纯协议路径（无浏览器）。若持续 Cloudflare，请更换代理出口 IP；"
+                "codex-console 在同一脏 IP 下首页也会失败。"
+            )
+
+        # Adopt entry session so subsequent user/register/otp share CF cookies + TLS fingerprint.
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = result.session
+        self.entry_mode = "chatgpt_web"
+        if result.device_id:
+            self.device_id = result.device_id
+        # Align request headers with entry fingerprint (UA / Client Hints)
+        profile = result.profile or {}
+        if profile.get("user_agent"):
+            self.clearance_user_agent = str(profile["user_agent"])
+            try:
+                self.session.headers["User-Agent"] = self.clearance_user_agent
+                self.session.headers["user-agent"] = self.clearance_user_agent
+            except Exception:
+                pass
+        # Platform PKCE not used by NextAuth entry; keep empty so token exchange prefers session path.
+        self.code_verifier = ""
+        step(index, f"官网入口完成[{result.page_type or '?'}]")
 
     def _platform_authorize(self, email: str, index: int) -> None:
         step(index, "开始 platform authorize")
@@ -617,17 +703,65 @@ class PlatformRegistrar:
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         data = _response_json(resp)
-        callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
+        self.continue_url = str(data.get("continue_url") or "").strip()
+        callback_params = extract_oauth_callback_params_from_url(self.continue_url)
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
         step(index, "创建账号资料完成")
 
+    def _exchange_via_chatgpt_session(self, index: int) -> dict | None:
+        """跟随 continue_url 并读取 chatgpt.com/api/auth/session 完整网页凭证。"""
+        ua = self.clearance_user_agent or user_agent
+        # Prefer continue_url; also try constructing callback if we only have code.
+        continue_url = self.continue_url
+        if (not continue_url) and self.platform_auth_code:
+            continue_url = (
+                f"{chatgpt_base}/api/auth/callback/openai"
+                f"?code={self.platform_auth_code}"
+            )
+        result = fetch_chatgpt_web_session(
+            self.session,
+            continue_url=continue_url,
+            user_agent=ua,
+            timeout=default_timeout,
+        )
+        if not result.get("ok"):
+            return None
+        return {
+            "access_token": result.get("access_token") or "",
+            "refresh_token": result.get("refresh_token") or "",
+            "id_token": result.get("id_token") or "",
+            "session_token": result.get("session_token") or "",
+            "email": result.get("email") or "",
+            "account_id": result.get("account_id") or "",
+            "expires_at": result.get("expires_at"),
+            "source": "chatgpt_session",
+            "raw_session": result.get("raw_session") or {},
+        }
+
     def _exchange_registered_tokens(self, index: int) -> dict:
         step(index, "开始换 token")
-        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
-        if not tokens:
-            raise RuntimeError("token换取失败")
-        step(index, "token 换取完成")
-        return tokens
+        # 优先网页 session（claims 更全，可直接做 Agent Identity）
+        tokens = self._exchange_via_chatgpt_session(index)
+        if tokens and tokens.get("access_token"):
+            step(index, "token 换取完成(session)")
+            return tokens
+
+        if self.platform_auth_code and self.code_verifier:
+            tokens = request_platform_oauth_token(
+                self.session, self.platform_auth_code, self.code_verifier
+            )
+            if tokens and tokens.get("access_token"):
+                # 有 platform token 后仍尝试升成 session
+                upgraded = self._exchange_via_chatgpt_session(index)
+                if upgraded and upgraded.get("access_token"):
+                    # 保留 platform refresh 作为兜底
+                    if not upgraded.get("refresh_token") and tokens.get("refresh_token"):
+                        upgraded["refresh_token"] = tokens.get("refresh_token")
+                    step(index, "token 换取完成(session)")
+                    return upgraded
+                step(index, "token 换取完成")
+                return tokens
+        raise RuntimeError("token换取失败（chatgpt session 与 platform code 均失败）")
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
@@ -641,7 +775,7 @@ class PlatformRegistrar:
         try:
             password = _random_password()
             first_name, last_name = _random_name()
-            self._platform_authorize(email, index)
+            self._authorize_bootstrap(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
@@ -657,12 +791,14 @@ class PlatformRegistrar:
             raise
         mail_provider.mark_mailbox_result(mailbox, success=True)
         return {
-            "email": email,
+            "email": str(tokens.get("email") or email).strip(),
             "password": password,
             "access_token": str(tokens.get("access_token") or "").strip(),
             "refresh_token": str(tokens.get("refresh_token") or "").strip(),
             "id_token": str(tokens.get("id_token") or "").strip(),
-            "source_type": "web",
+            "session_token": str(tokens.get("session_token") or "").strip(),
+            "account_id": str(tokens.get("account_id") or "").strip(),
+            "source_type": str(tokens.get("source") or tokens.get("source_type") or "chatgpt_session"),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 

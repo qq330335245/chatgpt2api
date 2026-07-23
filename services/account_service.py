@@ -1258,12 +1258,69 @@ class AccountService:
         session,
         *,
         email: str,
-        access_token: str,
-        refresh_token: str,
-        id_token: str,
-        source_type: str,
-        user_agent: str,
+        access_token: str = "",
+        refresh_token: str = "",
+        id_token: str = "",
+        source_type: str = "login",
+        user_agent: str = "",
+        continue_url: str = "",
+        prefer_web_session: bool = True,
     ) -> dict:
+        """组装登录结果；优先升级为 chatgpt.com/api/auth/session 完整网页凭证。"""
+        from services.register.chatgpt_web_entry import fetch_chatgpt_web_session
+
+        ua = str(user_agent or self._OAUTH_USER_AGENT)
+        session_creds: dict[str, Any] = {}
+        if prefer_web_session and session is not None:
+            try:
+                session_creds = fetch_chatgpt_web_session(
+                    session,
+                    continue_url=continue_url,
+                    user_agent=ua,
+                    timeout=30,
+                )
+            except Exception as exc:
+                self._relogin_trace(
+                    "web_session_fetch_exception",
+                    email=email,
+                    error=str(exc),
+                )
+                session_creds = {"ok": False, "error": str(exc)}
+
+        if session_creds.get("ok") and session_creds.get("access_token"):
+            self._relogin_trace(
+                "web_session_fetch_ok",
+                email=email,
+                account_id=str(session_creds.get("account_id") or ""),
+                has_session_token=bool(session_creds.get("session_token")),
+            )
+            # session access_token 优先；refresh 可回退 oauth
+            access = str(session_creds.get("access_token") or "").strip()
+            refresh = str(session_creds.get("refresh_token") or refresh_token or "").strip()
+            idt = str(session_creds.get("id_token") or id_token or "").strip()
+            jwt_payload = self._decode_jwt_payload(access)
+            return {
+                "ok": True,
+                "email": str(session_creds.get("email") or email).strip(),
+                "account_id": str(session_creds.get("account_id") or "").strip(),
+                "access_token": access,
+                "refresh_token": refresh,
+                "id_token": idt,
+                "session_token": str(session_creds.get("session_token") or "").strip(),
+                "expires_at": session_creds.get("expires_at") or jwt_payload.get("exp"),
+                "source_type": "chatgpt_session",
+                "raw_session": session_creds.get("raw_session") or {},
+            }
+
+        # fallback: oauth / provided tokens
+        access_token = str(access_token or "").strip()
+        if not access_token:
+            return {
+                "ok": False,
+                "error": "no_access_token",
+                "detail": session_creds if isinstance(session_creds, dict) else {},
+            }
+
         user_info: dict[str, Any] = {}
         try:
             me_resp = session.get(
@@ -1271,7 +1328,7 @@ class AccountService:
                 headers={
                     "accept": "application/json",
                     "authorization": f"Bearer {access_token}",
-                    "user-agent": user_agent,
+                    "user-agent": ua,
                 },
                 timeout=30,
             )
@@ -1283,20 +1340,96 @@ class AccountService:
             pass
 
         jwt_payload = self._decode_jwt_payload(access_token)
-        email_from_jwt = str(jwt_payload.get("https://api.openai.com/profile", {}).get("email") or "").strip()
+        email_from_jwt = str(
+            jwt_payload.get("https://api.openai.com/profile", {}).get("email") or ""
+        ).strip()
         account_id_from_jwt = str(
             jwt_payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id") or ""
         ).strip()
         account_info = user_info.get("account") if isinstance(user_info.get("account"), dict) else {}
+        self._relogin_trace(
+            "web_session_fetch_fallback_oauth",
+            email=email,
+            account_id=account_id_from_jwt or str(account_info.get("account_id") or ""),
+            session_error=str((session_creds or {}).get("error") or ""),
+        )
         return {
             "ok": True,
             "email": email_from_jwt or email,
             "account_id": account_id_from_jwt or account_info.get("account_id", ""),
             "access_token": access_token,
-            "refresh_token": refresh_token,
-            "id_token": id_token,
+            "refresh_token": str(refresh_token or "").strip(),
+            "id_token": str(id_token or "").strip(),
+            "session_token": "",
             "expires_at": jwt_payload.get("exp"),
             "source_type": source_type,
+        }
+
+
+    def _bootstrap_chatgpt_web_authorize(
+        self,
+        email: str,
+        *,
+        screen_hint: str = "login_or_signup",
+        event: str = "relogin",
+    ) -> dict:
+        """续期/重登：纯协议 ChatGPT 官网入口 authorize。"""
+        from services.register.chatgpt_web_entry import ChatGPTWebEntry
+
+        proxy = ""
+        try:
+            proxy = str(config.get_proxy_settings() or "").strip()
+        except Exception:
+            proxy = ""
+
+        def _log(msg: str) -> None:
+            self._relogin_trace("web_entry", email=email, event=event, message=msg)
+
+        entry = ChatGPTWebEntry(
+            email,
+            proxy=proxy,
+            log=_log,
+            timeout=30,
+            verbose=False,
+            screen_hint=screen_hint,
+        )
+        try:
+            result = entry.execute()
+        except Exception as exc:
+            try:
+                entry.close()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "error": f"web_entry_exception:{exc}",
+                "detail": {"message": str(exc)},
+            }
+
+        if not result.success:
+            try:
+                entry.close()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "error": "web_entry_failed",
+                "detail": {
+                    "message": result.error,
+                    "authorize_url": result.authorize_url,
+                    "final_url": result.final_url,
+                },
+            }
+
+        return {
+            "ok": True,
+            "session": result.session,
+            "device_id": result.device_id,
+            "final_url": result.final_url,
+            "page_type": result.page_type,
+            "profile": result.profile,
+            "authorize_url": result.authorize_url,
+            "user_agent": str((result.profile or {}).get("user_agent") or ""),
         }
 
     def _login_with_email_otp(
@@ -1325,102 +1458,39 @@ class AccountService:
         )
 
         auth_base = "https://auth.openai.com"
-        platform_oauth_audience = "https://api.openai.com/v1"
-        platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+        user_agent = self._OAUTH_USER_AGENT
         platform_oauth_client_id = self._OAUTH_CLIENT_ID
         platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
-        user_agent = self._OAUTH_USER_AGENT
-
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
-        session = requests.Session(**session_kwargs)
+        code_verifier = ""
+        session = None
 
         try:
-            device_id = str(uuid.uuid4())
-            from utils.pkce import generate_pkce
-
-            code_verifier, code_challenge = generate_pkce()
-
-            session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
-            session.cookies.set("oai-did", device_id, domain="auth.openai.com")
-            params = {
-                "issuer": auth_base,
-                "client_id": platform_oauth_client_id,
-                "audience": platform_oauth_audience,
-                "redirect_uri": platform_oauth_redirect_uri,
-                "device_id": device_id,
-                "screen_hint": "login_or_signup",
-                "max_age": "0",
-                "login_hint": email,
-                "scope": "openid profile email offline_access",
-                "response_type": "code",
-                "response_mode": "query",
-                "state": secrets.token_urlsafe(32),
-                "nonce": secrets.token_urlsafe(32),
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-                "auth0Client": platform_auth0_client,
-                "prompt": "login",
-            }
-            authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-            resp = session.get(
-                authorize_url,
-                headers={
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "user-agent": user_agent,
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "cross-site",
-                    "sec-fetch-user": "?1",
-                    "upgrade-insecure-requests": "1",
-                    "referer": "https://platform.openai.com/",
-                },
-                allow_redirects=True,
-                timeout=30,
+            boot = self._bootstrap_chatgpt_web_authorize(
+                email,
+                screen_hint="login_or_signup",
+                event="email_otp",
             )
+            if not boot.get("ok"):
+                return {
+                    "ok": False,
+                    "error": str(boot.get("error") or "web_entry_failed"),
+                    "detail": boot.get("detail") or {},
+                }
+
+            session = boot["session"]
+            device_id = str(boot.get("device_id") or uuid.uuid4())
+            final_url = str(boot.get("final_url") or f"{auth_base}/log-in")
+            if boot.get("user_agent"):
+                user_agent = str(boot["user_agent"])
             self._relogin_trace(
                 "email_otp_authorize",
                 email=email,
-                status=resp.status_code,
-                final_url=str(resp.url),
+                status=200,
+                final_url=final_url,
+                page_type=str(boot.get("page_type") or ""),
                 screen_hint="login_or_signup",
+                entry="chatgpt_web",
             )
-            if resp.status_code not in (200, 302):
-                return {
-                    "ok": False,
-                    "error": f"authorize_failed_{resp.status_code}",
-                    "detail": {"url": str(resp.url), "text": (resp.text or "")[:500]},
-                }
-
-            final_url = str(resp.url)
-            if "/error" in final_url and "payload=" in final_url:
-                try:
-                    parsed_query = parse_qs(urlparse(final_url).query)
-                    error_payload_b64 = parsed_query.get("payload", [""])[0]
-                    error_payload_b64 += "=" * ((4 - len(error_payload_b64) % 4) % 4)
-                    error_payload = json.loads(base64.b64decode(error_payload_b64))
-                    error_code = error_payload.get("errorCode", "")
-                    self._relogin_trace(
-                        "email_otp_authorize_error_page",
-                        email=email,
-                        error_code=error_code,
-                        detail=error_payload,
-                    )
-                    if error_code == "rate_limit_exceeded":
-                        return {"ok": False, "error": "rate_limit_exceeded", "detail": error_payload}
-                    return {"ok": False, "error": f"authorize_error_{error_code}", "detail": error_payload}
-                except Exception as exc:
-                    return {
-                        "ok": False,
-                        "error": "authorize_redirect_error",
-                        "detail": {"url": final_url, "parse_error": str(exc)},
-                    }
 
             login_headers = {
                 "accept": "application/json",
@@ -1619,12 +1689,48 @@ class AccountService:
                     "detail": otp_result.get("detail") or {},
                 }
 
+            # 优先走 chatgpt session（完整 claims，便于 Agent Identity）
+            continue_url = ""
+            detail = otp_result.get("detail") if isinstance(otp_result.get("detail"), dict) else {}
+            continue_url = str(detail.get("continue_url") or "").strip()
+            if continue_url and "code=" not in continue_url and auth_code:
+                # 某些响应只给中间页，尝试拼 callback
+                pass
+            if (not continue_url) and auth_code:
+                continue_url = (
+                    f"https://chatgpt.com/api/auth/callback/openai?code={auth_code}"
+                )
+
+            session_first = self._build_login_token_result(
+                session,
+                email=email,
+                access_token="",
+                refresh_token="",
+                id_token="",
+                source_type="email_otp",
+                user_agent=user_agent,
+                continue_url=continue_url,
+                prefer_web_session=True,
+            )
+            if session_first.get("ok") and session_first.get("access_token") and session_first.get("account_id"):
+                self._relogin_trace(
+                    "email_otp_success",
+                    email=session_first.get("email") or email,
+                    account_id=session_first.get("account_id"),
+                    expires_at=session_first.get("expires_at"),
+                    has_refresh_token=bool(session_first.get("refresh_token")),
+                    has_session_token=bool(session_first.get("session_token")),
+                    source_type=session_first.get("source_type"),
+                )
+                return session_first
+
             self._relogin_trace(
                 "email_otp_token_exchange_begin",
                 email=email,
                 auth_code_prefix=auth_code[:8] + "...",
             )
             platform_base = "https://platform.openai.com"
+            platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
             token_resp = session.post(
                 f"{auth_base}/api/accounts/oauth/token",
                 headers={
@@ -1677,6 +1783,8 @@ class AccountService:
                 id_token=str(token_data.get("id_token") or "").strip(),
                 source_type="email_otp",
                 user_agent=user_agent,
+                continue_url=continue_url,
+                prefer_web_session=True,
             )
             self._relogin_trace(
                 "email_otp_success",
@@ -1684,10 +1792,16 @@ class AccountService:
                 account_id=result.get("account_id"),
                 expires_at=result.get("expires_at"),
                 has_refresh_token=bool(result.get("refresh_token")),
+                has_session_token=bool(result.get("session_token")),
+                source_type=result.get("source_type"),
             )
             return result
         finally:
-            session.close()
+            try:
+                if session is not None:
+                    session.close()
+            except Exception:
+                pass
 
     def _login_with_password(
         self,
@@ -1717,91 +1831,36 @@ class AccountService:
         platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
         user_agent = self._OAUTH_USER_AGENT
         
-        # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
-        session = requests.Session(**session_kwargs)
-        
+        session = None
         try:
             device_id = str(uuid.uuid4())
-            
-            # ─── 方式2: OAuth authorize 流程 ──────────────────────────
-            # 使用 Platform Client + PKCE（与注册流程相同）
-            
-            from utils.pkce import generate_pkce
-            code_verifier, code_challenge = generate_pkce()
-            
-            # ② 发起 OAuth authorize 请求 (使用 Platform Client + PKCE)
-            session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
-            session.cookies.set("oai-did", device_id, domain="auth.openai.com")
-            params = {
-                "issuer": auth_base,
-                "client_id": platform_oauth_client_id,
-                "audience": platform_oauth_audience,
-                "redirect_uri": platform_oauth_redirect_uri,
-                "device_id": device_id,
-                "screen_hint": "login_or_signup",
-                "max_age": "0",
-                "login_hint": email,
-                "scope": "openid profile email offline_access",
-                "response_type": "code",
-                "response_mode": "query",
-                "state": secrets.token_urlsafe(32),
-                "nonce": secrets.token_urlsafe(32),
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-                "auth0Client": platform_auth0_client,
-            }
-            authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-            resp = session.get(
-                authorize_url,
-                headers={
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "user-agent": user_agent,
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "cross-site",
-                    "sec-fetch-user": "?1",
-                    "upgrade-insecure-requests": "1",
-                    "referer": "https://platform.openai.com/",
-                },
-                allow_redirects=True,
-                timeout=30,
+            code_verifier = ""
+            boot = self._bootstrap_chatgpt_web_authorize(
+                email,
+                screen_hint="login_or_signup",
+                event="password",
             )
-            
+            if not boot.get("ok"):
+                return {
+                    "ok": False,
+                    "error": str(boot.get("error") or "web_entry_failed"),
+                    "detail": boot.get("detail") or {},
+                }
+            session = boot["session"]
+            device_id = str(boot.get("device_id") or device_id)
+            final_url = str(boot.get("final_url") or f"{auth_base}/log-in")
+            if boot.get("user_agent"):
+                user_agent = str(boot["user_agent"])
             self._relogin_trace(
                 "password_authorize",
                 email=email,
-                status=resp.status_code,
-                final_url=str(resp.url),
+                status=200,
+                final_url=final_url,
+                page_type=str(boot.get("page_type") or ""),
                 screen_hint="login_or_signup",
+                entry="chatgpt_web",
             )
-            if resp.status_code not in (200, 302):
-                return {"ok": False, "error": f"authorize_failed_{resp.status_code}", "detail": {"url": resp.url, "text": resp.text[:500]}}
-            
-            # 检测最终 URL 是否指向错误页面
-            final_url = str(resp.url)
-            if "/error" in final_url and "payload=" in final_url:
-                from urllib.parse import parse_qs, urlparse
-                try:
-                    parsed_query = parse_qs(urlparse(final_url).query)
-                    error_payload_b64 = parsed_query.get("payload", [""])[0]
-                    error_payload_b64 += "=" * ((4 - len(error_payload_b64) % 4) % 4)
-                    error_payload = json.loads(base64.b64decode(error_payload_b64))
-                    error_code = error_payload.get("errorCode", "")
-                    if error_code == "rate_limit_exceeded":
-                        return {"ok": False, "error": "rate_limit_exceeded", "detail": error_payload}
-                    else:
-                        return {"ok": False, "error": f"authorize_error_{error_code}", "detail": error_payload}
-                except Exception as e:
-                    return {"ok": False, "error": "authorize_redirect_error", "detail": {"url": final_url, "parse_error": str(e)}}
-            
+
             # ③ 提交密码验证
             login_headers = {
                 "accept": "application/json",
@@ -1978,55 +2037,46 @@ class AccountService:
             access_token = str(token_data.get("access_token") or "").strip()
             refresh_token = str(token_data.get("refresh_token") or "").strip()
             id_token = str(token_data.get("id_token") or "").strip()
-            
-            # ⑤ 用 access_token 获取用户信息
-            user_info = {}
+
+            continue_url = ""
             try:
-                me_resp = session.get(
-                    "https://chatgpt.com/backend-api/me",
-                    headers={
-                        "accept": "application/json",
-                        "authorization": f"Bearer {access_token}",
-                        "user-agent": user_agent,
-                    },
-                    timeout=30,
-                )
-                if me_resp.status_code == 200:
-                    user_info = me_resp.json() if me_resp.text else {}
+                continue_url = str(login_data.get("continue_url") or "").strip()
             except Exception:
-                pass
-            
-            # 解析 JWT payload
-            jwt_payload = self._decode_jwt_payload(access_token)
-            
-            email_from_jwt = str(jwt_payload.get("https://api.openai.com/profile", {}).get("email") or "").strip()
-            account_id_from_jwt = str(
-                jwt_payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id") or ""
-            ).strip()
-            
-            account_info = user_info.get("account") if isinstance(user_info.get("account"), dict) else {}
-            result = {
-                "ok": True,
-                "email": email_from_jwt or email,
-                "account_id": account_id_from_jwt or account_info.get("account_id", ""),
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "id_token": id_token,
-                "expires_at": jwt_payload.get("exp"),
-                "source_type": "password",
-            }
+                continue_url = ""
+            if (not continue_url) and access_token:
+                # still try session upgrade using existing cookies / homepage
+                continue_url = ""
+
+            result = self._build_login_token_result(
+                session,
+                email=email,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                id_token=id_token,
+                source_type="password",
+                user_agent=user_agent,
+                continue_url=continue_url,
+                prefer_web_session=True,
+            )
+            if not result.get("ok"):
+                return result
             self._relogin_trace(
                 "password_login_success",
                 email=result.get("email") or email,
                 account_id=result.get("account_id"),
                 expires_at=result.get("expires_at"),
                 has_refresh_token=bool(result.get("refresh_token")),
+                has_session_token=bool(result.get("session_token")),
+                source_type=result.get("source_type"),
             )
-            
             return result
         
         finally:
-            session.close()
+            try:
+                if session is not None:
+                    session.close()
+            except Exception:
+                pass
 
     def list_expiring_access_tokens(self) -> list[str]:
         with self._lock:
