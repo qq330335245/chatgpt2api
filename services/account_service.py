@@ -5,6 +5,8 @@ import json
 import secrets
 import time
 import uuid
+import zlib
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +33,14 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    # 凭证快过期且 RT/密码都不可用时，重登兜底的最小间隔，避免频繁发 OTP
+    _RELOGIN_FALLBACK_BACKOFF_SECONDS = 30 * 60
+    # 全局最多同时跑几个重登，其余进队列
+    _RELOGIN_MAX_CONCURRENT = 3
+    # watcher / 批量刷新每轮最多新调度多少个重登
+    _RELOGIN_WATCHER_MAX_PER_ROUND = 5
+    # 每轮优先处理的快过期账号数（按 exp 升序 + 稳定 jitter）
+    _EXPIRING_TOKEN_BATCH_SIZE = 40
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -38,6 +48,31 @@ class AccountService:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/145.0.0.0 Safari/537.36"
     )
+    _RELOGIN_SOFT_ERRORS = {
+        "need_verification_code",
+        "otp_timeout",
+        "otp_mail_unavailable",
+        "otp_validate_failed",
+        "otp_no_auth_code",
+        "otp_max_check_attempts",
+        "passwordless_send_otp_failed",
+        "rate_limit_exceeded",
+        "invalid_state",
+        "missing_email",
+        "unexpected_about_you",
+        "unexpected_login_step",
+        "web_entry_failed",
+        "web_entry_exception",
+        "no_auth_code",
+        "token_exchange_failed",
+        "invalid_password",
+        "missing_refresh_token",
+    }
+    _RELOGIN_TERMINAL_ERRORS = {
+        "account_deactivated",
+        "unsupported_country_region_territory",
+        "missing_email",
+    }
 
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
@@ -53,6 +88,12 @@ class AccountService:
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
+        self._relogin_inflight: set[str] = set()
+        self._relogin_pending_tokens: set[str] = set()
+        self._relogin_pending: deque[dict[str, Any]] = deque()
+        self._relogin_active = 0
+        self._relogin_inflight_lock = Lock()
+        self._relogin_schedule_budget: int | None = None
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -250,6 +291,9 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["last_relogin_at"] = normalized.get("last_relogin_at") or None
+        normalized["last_relogin_error"] = normalized.get("last_relogin_error") or None
+        normalized["last_relogin_error_at"] = normalized.get("last_relogin_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 
@@ -361,6 +405,301 @@ class AccountService:
             return False
         return (datetime.now(timezone.utc) - last_error_at).total_seconds() < self._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
 
+
+    def _account_has_relogin_email(self, account: dict | None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        return bool(str(account.get("email") or "").strip())
+
+    def _recent_relogin_attempt(self, account: dict | None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        now = datetime.now(timezone.utc)
+        for key in ("last_relogin_at", "last_relogin_error_at"):
+            stamp = self._parse_time(account.get(key))
+            if stamp is None:
+                continue
+            if (now - stamp).total_seconds() < self._RELOGIN_FALLBACK_BACKOFF_SECONDS:
+                return True
+        return False
+
+    def _is_terminal_relogin_error(self, error: str, detail: object = None) -> bool:
+        err = str(error or "").strip()
+        err_l = err.lower()
+        if err in self._RELOGIN_TERMINAL_ERRORS or err_l in self._RELOGIN_TERMINAL_ERRORS:
+            return True
+        if "account_deactivated" in err_l:
+            return True
+        if isinstance(detail, dict):
+            nested = detail.get("error")
+            if isinstance(nested, dict) and str(nested.get("code") or "").strip().lower() == "account_deactivated":
+                return True
+        return False
+
+    def _is_soft_relogin_error(self, error: str) -> bool:
+        err = str(error or "").strip()
+        if err in self._RELOGIN_SOFT_ERRORS:
+            return True
+        err_l = err.lower()
+        return any(err_l.startswith(prefix) for prefix in (
+            "password_verify_failed_",
+            "web_entry_",
+            "oauth_refresh_http_",
+        ))
+
+    def _record_relogin_marker(
+        self,
+        access_token: str,
+        *,
+        started: bool = False,
+        error: str | None = None,
+    ) -> None:
+        if not access_token:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(resolved)
+            if current is None:
+                return
+            next_item = dict(current)
+            if started:
+                next_item["last_relogin_at"] = now
+            if error is not None:
+                next_item["last_relogin_error"] = str(error or "relogin failed")
+                next_item["last_relogin_error_at"] = now
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[resolved] = account
+                self._save_accounts()
+
+    def _clear_relogin_marker(self, access_token: str) -> None:
+        if not access_token:
+            return
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(resolved)
+            if current is None:
+                return
+            next_item = dict(current)
+            next_item["last_relogin_error"] = None
+            next_item["last_relogin_error_at"] = None
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[resolved] = account
+                self._save_accounts()
+
+    @classmethod
+    def _event_uses_relogin_budget(cls, event: str, progress_id: str | None = None) -> bool:
+        """批量/巡检触发的重登吃每轮预算；手动重登不限。"""
+        if progress_id:
+            return False
+        event_name = str(event or "").strip()
+        if not event_name:
+            return True
+        if event_name.startswith("manual_relogin") or event_name.startswith("manual_"):
+            return False
+        return (
+            event_name.startswith("refresh_accounts")
+            or event_name.startswith("refresh_token_keepalive")
+            or event_name.startswith("auto_relogin")
+            or "account-watcher" in event_name
+            or event_name.startswith("fetch_remote_info")
+        )
+
+    def begin_watcher_relogin_round(self, max_schedules: int | None = None) -> None:
+        """watcher 每轮开始时重置重登调度预算。"""
+        budget = self._RELOGIN_WATCHER_MAX_PER_ROUND if max_schedules is None else max(0, int(max_schedules))
+        with self._relogin_inflight_lock:
+            self._relogin_schedule_budget = budget
+
+    def get_relogin_queue_stats(self) -> dict[str, int]:
+        with self._relogin_inflight_lock:
+            budget = self._relogin_schedule_budget
+            return {
+                "active": int(self._relogin_active),
+                "pending": len(self._relogin_pending),
+                "inflight": len(self._relogin_inflight),
+                "budget_remaining": -1 if budget is None else int(budget),
+                "max_concurrent": int(self._RELOGIN_MAX_CONCURRENT),
+            }
+
+    def _consume_relogin_budget_locked(self, event: str, progress_id: str | None = None) -> bool:
+        if not self._event_uses_relogin_budget(event, progress_id):
+            return True
+        if self._relogin_schedule_budget is None:
+            # 非 watcher 上下文的自动触发：给一个较小默认窗口，避免完全放飞
+            self._relogin_schedule_budget = self._RELOGIN_WATCHER_MAX_PER_ROUND
+        if self._relogin_schedule_budget <= 0:
+            return False
+        self._relogin_schedule_budget -= 1
+        return True
+
+    def _enqueue_relogin_job_locked(self, job: dict[str, Any]) -> None:
+        token = str(job.get("access_token") or "").strip()
+        if not token:
+            return
+        self._relogin_pending.append(job)
+        self._relogin_pending_tokens.add(token)
+
+    def _start_relogin_job(self, job: dict[str, Any]) -> None:
+        active_token = str(job.get("access_token") or "").strip()
+        email = str(job.get("email") or "").strip()
+        password = str(job.get("password") or "").strip()
+        event = str(job.get("event") or "relogin_fallback")
+        reason = str(job.get("reason") or "")
+        progress_id = job.get("progress_id")
+        progress_id = str(progress_id) if progress_id else None
+
+        self._record_relogin_marker(active_token, started=True)
+        self._relogin_trace(
+            "fallback_started",
+            email=email,
+            token=anonymize_token(active_token),
+            reason=reason or event,
+            has_password=bool(password),
+            event=event,
+            queue=self.get_relogin_queue_stats(),
+        )
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "凭证刷新失败，启动重登兜底",
+            {
+                "source": event,
+                "token": anonymize_token(active_token),
+                "email": email,
+                "reason": reason,
+                "has_password": bool(password),
+            },
+        )
+
+        def _runner() -> None:
+            try:
+                self._password_re_login_thread(
+                    active_token,
+                    email,
+                    password,
+                    event,
+                    progress_id,
+                )
+            finally:
+                with self._relogin_inflight_lock:
+                    self._relogin_inflight.discard(active_token)
+                    self._relogin_active = max(0, int(self._relogin_active) - 1)
+                    latest = None
+                try:
+                    latest = self.get_account(active_token) or {}
+                except Exception:
+                    latest = {}
+                latest_token = str((latest or {}).get("access_token") or "").strip()
+                with self._relogin_inflight_lock:
+                    if latest_token:
+                        self._relogin_inflight.discard(latest_token)
+                self._pump_relogin_queue()
+
+        Thread(
+            target=_runner,
+            name=f"relogin-fallback-{anonymize_token(active_token)}",
+            daemon=True,
+        ).start()
+
+    def _pump_relogin_queue(self) -> None:
+        """把排队中的重登任务填满到全局并发上限。"""
+        while True:
+            job: dict[str, Any] | None = None
+            with self._relogin_inflight_lock:
+                if self._relogin_active >= self._RELOGIN_MAX_CONCURRENT:
+                    return
+                while self._relogin_pending:
+                    candidate = self._relogin_pending.popleft()
+                    token = str(candidate.get("access_token") or "").strip()
+                    self._relogin_pending_tokens.discard(token)
+                    if not token:
+                        continue
+                    if token in self._relogin_inflight:
+                        continue
+                    self._relogin_inflight.add(token)
+                    self._relogin_active += 1
+                    job = candidate
+                    break
+                if job is None:
+                    return
+            self._start_relogin_job(job)
+
+    def _schedule_relogin_fallback(
+        self,
+        access_token: str,
+        event: str,
+        reason: str = "",
+        progress_id: str | None = None,
+    ) -> bool:
+        """RT 刷新失败或缺失时，排队走密码/邮件 OTP 重登兜底。
+
+        - 全局最多同时 _RELOGIN_MAX_CONCURRENT 个重登
+        - watcher/批量刷新受每轮预算限制
+        - 同账号 inflight/pending/backoff 去重
+        """
+        resolved_token, account = self._get_account_for_token(access_token)
+        if not account:
+            return False
+        active_token = str(account.get("access_token") or resolved_token or access_token).strip()
+        email = str(account.get("email") or "").strip()
+        if not email:
+            return False
+        if self._recent_relogin_attempt(account):
+            self._relogin_trace(
+                "fallback_skipped_backoff",
+                email=email,
+                token=anonymize_token(active_token),
+                reason=reason or event,
+            )
+            return False
+
+        password = str(account.get("password") or "").strip()
+        job = {
+            "access_token": active_token,
+            "email": email,
+            "password": password,
+            "event": event,
+            "reason": str(reason or ""),
+            "progress_id": progress_id,
+        }
+
+        with self._relogin_inflight_lock:
+            if active_token in self._relogin_inflight or active_token in self._relogin_pending_tokens:
+                self._relogin_trace(
+                    "fallback_skipped_inflight",
+                    email=email,
+                    token=anonymize_token(active_token),
+                    reason=reason or event,
+                    pending=active_token in self._relogin_pending_tokens,
+                )
+                return False
+            if not self._consume_relogin_budget_locked(event, progress_id):
+                self._relogin_trace(
+                    "fallback_skipped_budget",
+                    email=email,
+                    token=anonymize_token(active_token),
+                    reason=reason or event,
+                    budget_remaining=int(self._relogin_schedule_budget or 0),
+                )
+                return False
+            self._enqueue_relogin_job_locked(job)
+            self._relogin_trace(
+                "fallback_queued",
+                email=email,
+                token=anonymize_token(active_token),
+                reason=reason or event,
+                has_password=bool(password),
+                event=event,
+                active=int(self._relogin_active),
+                pending=len(self._relogin_pending),
+                budget_remaining=(-1 if self._relogin_schedule_budget is None else int(self._relogin_schedule_budget)),
+            )
+
+        self._pump_relogin_queue()
+        return True
+
     def _recent_refresh_token_keepalive_error(self, account: dict, now: datetime) -> bool:
         last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
         if last_error_at is None:
@@ -442,6 +781,8 @@ class AccountService:
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
+            next_item["last_relogin_error"] = None
+            next_item["last_relogin_error_at"] = None
             next_item["invalid_count"] = 0
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
@@ -487,30 +828,27 @@ class AccountService:
             active_token = str(account.get("access_token") or resolved_token or access_token)
             if not self._token_needs_refresh(active_token, force=force):
                 return active_token
+
             refresh_token = str(account.get("refresh_token") or "").strip()
-            if not refresh_token:
-                return active_token
-            if not force and self._recent_token_refresh_error(account):
-                return active_token
-            try:
-                token_data = self._request_access_token_refresh(refresh_token, account)
-            except Exception as exc:
-                error_str = str(exc or "")
-                self._record_token_refresh_error(active_token, event, error_str)
-                # 如果是 app_session_terminated 错误，尝试密码重新登录
-                if "app_session_terminated" in error_str.lower():
-                    # 获取账号信息：有密码走密码登录，仅邮箱走验证码登录
-                    email = str(account.get("email") or "").strip()
-                    password = str(account.get("password") or "").strip()
-                    if email:
-                        t = Thread(
-                            target=self._password_re_login_thread,
-                            args=(active_token, email, password, event),
-                            daemon=True,
-                        )
-                        t.start()
-                return active_token
-            return self._apply_refreshed_tokens(active_token, token_data, event)
+            fallback_reason = ""
+
+            if refresh_token and (force or not self._recent_token_refresh_error(account)):
+                try:
+                    token_data = self._request_access_token_refresh(refresh_token, account)
+                except Exception as exc:
+                    fallback_reason = str(exc or "refresh_token_failed")
+                    self._record_token_refresh_error(active_token, event, fallback_reason)
+                else:
+                    return self._apply_refreshed_tokens(active_token, token_data, event)
+            elif not refresh_token:
+                fallback_reason = "missing_refresh_token"
+            else:
+                fallback_reason = str(account.get("last_token_refresh_error") or "recent_refresh_token_error")
+
+            # RT 不可用/失败时，若账号仍有邮箱，则走密码 -> 邮件 OTP 重登兜底
+            if self._account_has_relogin_email(account):
+                self._schedule_relogin_fallback(active_token, event, reason=fallback_reason)
+            return active_token
 
 
     @staticmethod
@@ -534,7 +872,14 @@ class AccountService:
         print(f"[relogin] {step}{suffix}", flush=True)
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
-        """账号重新登录线程入口：有密码走密码登录，无密码走邮箱验证码登录。"""
+        """账号重新登录线程入口。
+
+        级联顺序：
+        1. 有密码时先走密码登录（必要时含 OTP 二步）
+        2. 密码失败且非终态错误时，再走纯邮件验证码登录兜底
+        3. 无密码时直接走纯邮件验证码登录
+        """
+        login_method = "password" if str(password or "").strip() else "email_otp"
         try:
             self._relogin_trace(
                 "thread_start",
@@ -559,14 +904,15 @@ class AccountService:
                 receive_email=receive_email,
                 mail_provider_ref=mail_provider_ref,
                 mail_provider_type=mail_provider_type,
-                method="password" if str(password or "").strip() else "email_otp",
+                method=login_method,
             )
-            self._relogin_trace(
-                "login_begin",
-                email=email,
-                method="password" if str(password or "").strip() else "email_otp",
-            )
+
+            result: dict[str, Any] = {"ok": False, "error": "no_login_method"}
+            methods_tried: list[str] = []
+
             if str(password or "").strip():
+                methods_tried.append("password")
+                self._relogin_trace("login_begin", email=email, method="password")
                 result = self._login_with_password(
                     email,
                     password,
@@ -574,50 +920,92 @@ class AccountService:
                     mail_provider_ref=mail_provider_ref,
                     mail_provider_type=mail_provider_type,
                 )
+                login_method = "password"
+                self._relogin_trace(
+                    "login_result",
+                    email=email,
+                    method="password",
+                    ok=bool(result.get("ok")),
+                    error=str(result.get("error") or ""),
+                    detail=result.get("detail") if not result.get("ok") else None,
+                )
+                if result.get("ok"):
+                    pass
+                elif self._is_terminal_relogin_error(str(result.get("error") or ""), result.get("detail")):
+                    pass
+                else:
+                    self._relogin_trace(
+                        "password_fallback_to_email_otp",
+                        email=email,
+                        error=str(result.get("error") or ""),
+                    )
+                    methods_tried.append("email_otp")
+                    self._relogin_trace("login_begin", email=email, method="email_otp")
+                    otp_result = self._login_with_email_otp(
+                        email,
+                        receive_email=receive_email,
+                        mail_provider_ref=mail_provider_ref,
+                        mail_provider_type=mail_provider_type,
+                    )
+                    self._relogin_trace(
+                        "login_result",
+                        email=email,
+                        method="email_otp",
+                        ok=bool(otp_result.get("ok")),
+                        error=str(otp_result.get("error") or ""),
+                        detail=otp_result.get("detail") if not otp_result.get("ok") else None,
+                    )
+                    if otp_result.get("ok"):
+                        result = otp_result
+                        login_method = "email_otp_fallback"
+                    else:
+                        result = otp_result
+                        login_method = "email_otp_fallback"
             else:
+                methods_tried.append("email_otp")
+                login_method = "email_otp"
+                self._relogin_trace("login_begin", email=email, method="email_otp")
                 result = self._login_with_email_otp(
                     email,
                     receive_email=receive_email,
                     mail_provider_ref=mail_provider_ref,
                     mail_provider_type=mail_provider_type,
                 )
-            login_method = "password" if str(password or "").strip() else "email_otp"
-            self._relogin_trace(
-                "login_result",
-                email=email,
-                method=login_method,
-                ok=bool(result.get("ok")),
-                error=str(result.get("error") or ""),
-                detail=result.get("detail") if not result.get("ok") else None,
-            )
+                self._relogin_trace(
+                    "login_result",
+                    email=email,
+                    method="email_otp",
+                    ok=bool(result.get("ok")),
+                    error=str(result.get("error") or ""),
+                    detail=result.get("detail") if not result.get("ok") else None,
+                )
+
             if result.get("ok"):
-                # 登录成功，更新账号
                 new_access_token = str(result.get("access_token") or "")
                 new_refresh_token = result.get("refresh_token", "")
                 new_id_token = result.get("id_token", "")
                 new_expires_at = result.get("expires_at")
 
-                # 构建 token_data 供 _apply_refreshed_tokens 使用
                 token_data = {
                     "access_token": new_access_token,
                     "refresh_token": new_refresh_token,
                     "id_token": new_id_token,
                 }
-
-                # 使用 _apply_refreshed_tokens 更新账号（处理 token 别名）
-                new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:password_relogin")
-
-                # 额外更新 source_type 和 status（静默，避免重复日志）
+                new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:relogin")
                 self.update_account(new_token, {
                     "source_type": result.get("source_type", login_method),
                     "status": "正常",
+                    "last_relogin_error": None,
+                    "last_relogin_error_at": None,
                 }, quiet=True)
+                self._clear_relogin_marker(new_token)
 
                 expiry = self._format_token_expiry(new_access_token or new_token, new_expires_at)
                 self._relogin_trace(
                     "renew_success",
                     email=email,
                     method=login_method,
+                    methods_tried=methods_tried,
                     old_token=anonymize_token(access_token),
                     new_token=anonymize_token(new_access_token or new_token),
                     expires_at=expiry.get("expires_at"),
@@ -630,6 +1018,7 @@ class AccountService:
                     {
                         "source": event,
                         "method": login_method,
+                        "methods_tried": methods_tried,
                         "old_token": anonymize_token(access_token),
                         "new_token": anonymize_token(new_access_token or new_token),
                         "email": email,
@@ -647,92 +1036,92 @@ class AccountService:
                         extra={
                             "email": email,
                             "method": login_method,
+                            "methods_tried": methods_tried,
                             "expires_at": expiry.get("expires_at"),
                             "expires_at_text": expiry.get("expires_at_text"),
                             "expires_in_seconds": expiry.get("expires_in_seconds"),
                         },
                     )
-            else:
-                # 登录失败
-                error_type = str(result.get("error") or "")
-                soft_errors = {
-                    "need_verification_code",
-                    "otp_timeout",
-                    "otp_mail_unavailable",
-                    "otp_validate_failed",
-                    "otp_no_auth_code",
-                    "otp_max_check_attempts",
-                    "passwordless_send_otp_failed",
-                    "rate_limit_exceeded",
-                    "invalid_state",
-                    "missing_email",
-                    "unexpected_about_you",
-                    "unexpected_login_step",
-                }
-                fail_payload = {
-                    "source": event,
-                    "method": login_method,
-                    "token": anonymize_token(access_token),
-                    "email": email,
-                    "status": "失败",
-                    "error": error_type,
-                    "detail": result.get("detail", {}),
-                }
-                self._relogin_trace(
-                    "renew_failed",
-                    email=email,
-                    method=login_method,
-                    error=error_type,
-                    soft=error_type in soft_errors,
-                    detail=result.get("detail", {}),
+                return
+
+            error_type = str(result.get("error") or "")
+            soft = self._is_soft_relogin_error(error_type)
+            terminal = self._is_terminal_relogin_error(error_type, result.get("detail"))
+            fail_payload = {
+                "source": event,
+                "method": login_method,
+                "methods_tried": methods_tried,
+                "token": anonymize_token(access_token),
+                "email": email,
+                "status": "失败",
+                "error": error_type,
+                "detail": result.get("detail", {}),
+            }
+            self._relogin_trace(
+                "renew_failed",
+                email=email,
+                method=login_method,
+                methods_tried=methods_tried,
+                error=error_type,
+                soft=soft,
+                terminal=terminal,
+                detail=result.get("detail", {}),
+            )
+            self._record_relogin_marker(access_token, error=error_type or "relogin failed")
+
+            if soft and not terminal:
+                fail_payload["soft"] = True
+                log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
+                if progress_id:
+                    self.update_relogin_progress(
+                        progress_id,
+                        access_token,
+                        "失败",
+                        error_type,
+                        extra={
+                            "email": email,
+                            "method": login_method,
+                            "methods_tried": methods_tried,
+                            "detail": result.get("detail", {}),
+                        },
+                    )
+                return
+
+            log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
+            if terminal and (
+                error_type == "account_deactivated"
+                or "account_deactivated" in error_type.lower()
+                or (
+                    error_type == "password_verify_failed_403"
+                    and isinstance(result.get("detail"), dict)
+                    and isinstance(result["detail"].get("error"), dict)
+                    and result["detail"]["error"].get("code") == "account_deactivated"
                 )
-                if error_type in soft_errors:
-                    fail_payload["soft"] = True
-                    log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
-                    if progress_id:
-                        self.update_relogin_progress(
-                            progress_id,
-                            access_token,
-                            "失败",
-                            error_type,
-                            extra={"email": email, "method": login_method, "detail": result.get("detail", {})},
-                        )
-                    return
-                if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
-                    log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
-                    detail_error = result["detail"].get("error", {})
-                    if isinstance(detail_error, dict) and detail_error.get("code") == "account_deactivated":
-                        # 账号已删除/停用 → 标记为禁用
-                        self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
-                        log_service.add(
-                            LOG_TYPE_ACCOUNT,
-                            "账号已停用-标记禁用",
-                            {
-                                "source": event,
-                                "method": login_method,
-                                "token": anonymize_token(access_token),
-                                "email": email,
-                                "detail": result.get("detail", {}),
-                            },
-                        )
-                        if progress_id:
-                            self.update_relogin_progress(progress_id, access_token, "禁用")
-                    else:
-                        # 永久故障：将账号标记为异常（或自动移除）
-                        self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
-                        if progress_id:
-                            self.update_relogin_progress(progress_id, access_token, "异常", error_type)
-                else:
-                    log_service.add(LOG_TYPE_ACCOUNT, "账号续期失败", fail_payload)
-                    # 永久故障：将账号标记为异常（或自动移除）
-                    self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
-                    if progress_id:
-                        self.update_relogin_progress(progress_id, access_token, "异常", error_type)
+            ):
+                self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "账号已停用-标记禁用",
+                    {
+                        "source": event,
+                        "method": login_method,
+                        "token": anonymize_token(access_token),
+                        "email": email,
+                        "detail": result.get("detail", {}),
+                    },
+                )
+                if progress_id:
+                    self.update_relogin_progress(progress_id, access_token, "禁用")
+                return
+
+            self.remove_invalid_token(access_token, f"{event}:relogin_failed", quiet=True)
+            if progress_id:
+                self.update_relogin_progress(progress_id, access_token, "异常", error_type)
         except Exception as exc:
             self._relogin_trace(
                 "renew_exception",
                 email=email,
-                method="password" if str(password or "").strip() else "email_otp",
+                method=login_method,
                 error=str(exc),
             )
             log_service.add(
@@ -740,15 +1129,15 @@ class AccountService:
                 "账号续期异常",
                 {
                     "source": event,
-                    "method": "password" if str(password or "").strip() else "email_otp",
+                    "method": login_method,
                     "token": anonymize_token(access_token),
                     "email": email,
                     "status": "异常",
                     "error": str(exc),
                 },
             )
-            # 将账号标记为异常（或自动移除）
-            self.remove_invalid_token(access_token, f"{event}:password_relogin_exception", quiet=True)
+            self._record_relogin_marker(access_token, error=str(exc))
+            self.remove_invalid_token(access_token, f"{event}:relogin_exception", quiet=True)
             if progress_id:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
 
@@ -2124,15 +2513,37 @@ class AccountService:
             except Exception:
                 pass
 
-    def list_expiring_access_tokens(self) -> list[str]:
+    def list_expiring_access_tokens(self, limit: int | None = None) -> list[str]:
+        """即将过期的 access_token。
+
+        含两类：
+        - 有 refresh_token，可走 OAuth 刷新
+        - 无 RT 但有邮箱，可走重登兜底
+
+        默认按 exp 升序 + token 稳定 jitter 排序，优先最紧急的；
+        limit 用于 watcher 错峰，避免同一轮打满全库。
+        """
         with self._lock:
-            return [
-                token
-                for account in self._accounts.values()
-                if str(account.get("refresh_token") or "").strip()
-                and (token := str(account.get("access_token") or "").strip())
-                and self._token_needs_refresh(token)
-            ]
+            ranked: list[tuple[int, int, str]] = []
+            for account in self._accounts.values():
+                token = str(account.get("access_token") or "").strip()
+                if not token or not self._token_needs_refresh(token):
+                    continue
+                has_rt = bool(str(account.get("refresh_token") or "").strip())
+                has_email = bool(str(account.get("email") or "").strip())
+                if not (has_rt or has_email):
+                    continue
+                exp = self._jwt_exp(token) or 0
+                # 稳定抖动：同一 exp 附近打散顺序，避免每轮完全同一批
+                jitter = zlib.crc32(token.encode("utf-8")) & 0xFFFF
+                ranked.append((exp, jitter, token))
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+        tokens = [token for _, _, token in ranked]
+        if limit is None:
+            limit = self._EXPIRING_TOKEN_BATCH_SIZE
+        if limit >= 0:
+            tokens = tokens[: int(limit)]
+        return tokens
 
     def list_refresh_token_keepalive_tokens(self) -> list[str]:
         now = datetime.now(timezone.utc)
@@ -2832,13 +3243,12 @@ class AccountService:
                 password = str(account.get("password") or "").strip()
                 if not email:
                     continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
+                if self._schedule_relogin_fallback(
+                    token,
+                    "auto_relogin_after_refresh",
+                    reason="status_abnormal",
+                ):
+                    relogined += 1
 
         result = {
             "refreshed": refreshed,
@@ -2904,13 +3314,13 @@ class AccountService:
                 mail_provider_ref=str(account.get("mail_provider_ref") or ""),
                 mail_provider_type=str(account.get("mail_provider_type") or ""),
             )
-            t = Thread(
-                target=self._password_re_login_thread,
-                args=(token, email, password, "manual_relogin", progress_id),
-                daemon=True,
-            )
-            t.start()
-            relogined += 1
+            if self._schedule_relogin_fallback(
+                token,
+                "manual_relogin",
+                reason="manual",
+                progress_id=progress_id,
+            ):
+                relogined += 1
 
         result = {
             "relogined": relogined,

@@ -85,19 +85,26 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
+                # 每轮重置重登预算，避免大批量同时打登录/OTP
+                account_service.begin_watcher_relogin_round()
                 limited_tokens = account_service.list_limited_tokens()
                 normal_tokens = account_service.list_normal_tokens()
+                # 快过期账号按 exp+jitter 错峰，限制单轮数量
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
                 tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
+                    queue_stats = account_service.get_relogin_queue_stats()
                     print(
                         "[account-watcher] checking "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(normal_tokens)} normal accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
+                        f"{len(expiring_tokens)} expiring access tokens, "
+                        f"relogin_budget={queue_stats.get('budget_remaining')} "
+                        f"relogin_active={queue_stats.get('active')} "
+                        f"relogin_pending={queue_stats.get('pending')}"
                     )
                     account_service.refresh_accounts(tokens)
                 if keepalive_tokens:
@@ -105,6 +112,14 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                     result = account_service.keepalive_refresh_tokens(keepalive_tokens)
                     if result.get("errors"):
                         print(f"[account-watcher] keepalive errors: {result['errors']}")
+                queue_stats = account_service.get_relogin_queue_stats()
+                if queue_stats.get("active") or queue_stats.get("pending"):
+                    print(
+                        "[account-watcher] relogin queue "
+                        f"active={queue_stats.get('active')} "
+                        f"pending={queue_stats.get('pending')} "
+                        f"budget_remaining={queue_stats.get('budget_remaining')}"
+                    )
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
             stop_event.wait(interval_seconds)
