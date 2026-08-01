@@ -59,5 +59,50 @@ class ConfigLoadingTests(unittest.TestCase):
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
 
+
+
+    def test_save_falls_back_to_data_config_when_primary_readonly(self) -> None:
+        import os
+        import stat
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            data_dir = base_dir / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            primary = base_dir / "config.json"
+            primary.write_text('{"auth-key": "test-auth", "proxy": ""}', encoding="utf-8")
+            # make primary read-only
+            os.chmod(primary, stat.S_IREAD)
+
+            module = self.config_module
+            old_base = module.BASE_DIR
+            old_data = module.DATA_DIR
+            old_config = module.CONFIG_FILE
+            old_data_config = module.DATA_CONFIG_FILE
+            try:
+                module.BASE_DIR = base_dir
+                module.DATA_DIR = data_dir
+                module.CONFIG_FILE = primary
+                module.DATA_CONFIG_FILE = data_dir / "config.json"
+                store = module.ConfigStore(primary)
+                store.update({"proxy": "http://127.0.0.1:7890", "base_url": "http://example:18083"})
+                self.assertTrue((data_dir / "config.json").exists())
+                # reload should pick overlay
+                store2 = module.ConfigStore(primary)
+                self.assertEqual(store2.get_proxy_settings(), "http://127.0.0.1:7890")
+                self.assertIn("http://example:18083", store2.base_url)
+            finally:
+                module.BASE_DIR = old_base
+                module.DATA_DIR = old_data
+                module.CONFIG_FILE = old_config
+                module.DATA_CONFIG_FILE = old_data_config
+                try:
+                    os.chmod(primary, stat.S_IWRITE | stat.S_IREAD)
+                except Exception:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

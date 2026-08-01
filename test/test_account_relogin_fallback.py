@@ -215,5 +215,78 @@ class AccountReloginFallbackTests(unittest.TestCase):
 
 
 
+
+
+    def test_relogin_persists_session_and_platform_rt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+            old_token = _jwt_with_exp(60)
+            new_token = _jwt_with_exp(3600)
+            service._accounts = {
+                old_token: service._normalize_account(
+                    {
+                        "access_token": old_token,
+                        "email": "user@example.com",
+                        "status": "正常",
+                    }
+                )
+            }
+            with patch.object(
+                service,
+                "_login_with_email_otp",
+                return_value={
+                    "ok": True,
+                    "access_token": new_token,
+                    "refresh_token": "rt-platform",
+                    "id_token": "id-new",
+                    "session_token": "sess-web",
+                    "account_id": "acc-1",
+                    "email": "user@example.com",
+                    "source_type": "chatgpt_session+platform_rt",
+                    "expires_at": int(time.time()) + 3600,
+                },
+            ):
+                service._password_re_login_thread(old_token, "user@example.com", "", "unit_test")
+            account = service.get_account(new_token)
+            self.assertIsNotNone(account)
+            assert account is not None
+            self.assertEqual(account.get("refresh_token"), "rt-platform")
+            self.assertEqual(account.get("session_token"), "sess-web")
+            self.assertEqual(account.get("account_id"), "acc-1")
+            self.assertEqual(account.get("status"), "正常")
+
+    def test_build_login_result_enriches_missing_rt_via_platform_oauth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+            access = _jwt_with_exp(3600)
+            fake_session = object()
+            with patch(
+                "services.register.chatgpt_web_entry.fetch_chatgpt_web_session",
+                return_value={
+                    "ok": True,
+                    "access_token": access,
+                    "session_token": "sess-1",
+                    "account_id": "acc-9",
+                    "email": "user@example.com",
+                    "expires_at": int(time.time()) + 3600,
+                    "raw_session": {},
+                },
+            ), patch.object(
+                service,
+                "_obtain_platform_tokens_via_session",
+                return_value={"refresh_token": "rt-from-platform", "id_token": "id-from-platform"},
+            ) as obtain:
+                result = service._build_login_token_result(
+                    fake_session,
+                    email="user@example.com",
+                    prefer_web_session=True,
+                )
+            obtain.assert_called_once()
+            self.assertTrue(result.get("ok"))
+            self.assertEqual(result.get("refresh_token"), "rt-from-platform")
+            self.assertEqual(result.get("session_token"), "sess-1")
+            self.assertEqual(result.get("source_type"), "chatgpt_session+platform_rt")
+
+
 if __name__ == "__main__":
     unittest.main()

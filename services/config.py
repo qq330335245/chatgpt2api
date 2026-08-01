@@ -13,6 +13,8 @@ from services.storage.base import StorageBackend
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
+# Docker often mounts root config.json as read-only; writable overlay lives on data volume.
+DATA_CONFIG_FILE = DATA_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
@@ -327,9 +329,20 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
+def _merge_config_layers(*layers: dict[str, object]) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for layer in layers:
+        if isinstance(layer, dict) and layer:
+            merged.update(layer)
+    return merged
+
+
 def _load_settings() -> LoadedSettings:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    raw_config = _read_json_object(CONFIG_FILE, name="config.json")
+    raw_config = _merge_config_layers(
+        _read_json_object(CONFIG_FILE, name="config.json"),
+        _read_json_object(DATA_CONFIG_FILE, name="data/config.json"),
+    )
     auth_key = _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or raw_config.get("auth-key"))
     if _is_invalid_auth_key(auth_key):
         raise ValueError(
@@ -351,6 +364,7 @@ def _load_settings() -> LoadedSettings:
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
+        self.writable_path = path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._storage_backend: StorageBackend | None = None
@@ -365,10 +379,49 @@ class ConfigStore:
             )
 
     def _load(self) -> dict[str, object]:
-        return _read_json_object(self.path, name="config.json")
+        # Base config + data overlay. When /app/config.json is read-only, UI saves go to data/config.json.
+        base = _read_json_object(self.path, name="config.json")
+        overlay = _read_json_object(DATA_CONFIG_FILE, name="data/config.json")
+        if overlay:
+            self.writable_path = DATA_CONFIG_FILE
+        return _merge_config_layers(base, overlay)
+
+    def _path_is_writable(self, path: Path) -> bool:
+        try:
+            if path.exists():
+                if path.is_dir():
+                    return False
+                return os.access(path, os.W_OK)
+            parent = path.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            return os.access(parent, os.W_OK)
+        except OSError:
+            return False
+
+    def _resolve_writable_path(self) -> Path:
+        if self._path_is_writable(self.path):
+            return self.path
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return DATA_CONFIG_FILE
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        target = self._resolve_writable_path()
+        payload = json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(payload, encoding="utf-8")
+            self.writable_path = target
+        except OSError as exc:
+            if target != DATA_CONFIG_FILE:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                DATA_CONFIG_FILE.write_text(payload, encoding="utf-8")
+                self.writable_path = DATA_CONFIG_FILE
+                print(
+                    f"[config] primary config not writable ({exc}); saved to {DATA_CONFIG_FILE}",
+                    file=sys.stderr,
+                )
+                return
+            raise
 
     @property
     def auth_key(self) -> str:

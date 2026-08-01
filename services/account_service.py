@@ -778,6 +778,14 @@ class AccountService:
                 next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
             if token_data.get("id_token"):
                 next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            if token_data.get("session_token"):
+                next_item["session_token"] = str(token_data.get("session_token") or "").strip()
+            if token_data.get("account_id"):
+                next_item["account_id"] = str(token_data.get("account_id") or "").strip()
+            if token_data.get("email"):
+                next_item["email"] = str(token_data.get("email") or "").strip() or next_item.get("email")
+            if token_data.get("source_type"):
+                next_item["source_type"] = self._normalize_source_type(token_data.get("source_type"))
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
@@ -990,11 +998,18 @@ class AccountService:
                     "access_token": new_access_token,
                     "refresh_token": new_refresh_token,
                     "id_token": new_id_token,
+                    "session_token": result.get("session_token", ""),
+                    "account_id": result.get("account_id", ""),
+                    "email": result.get("email") or email,
+                    "source_type": result.get("source_type", login_method),
                 }
                 new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:relogin")
                 self.update_account(new_token, {
                     "source_type": result.get("source_type", login_method),
                     "status": "正常",
+                    "session_token": str(result.get("session_token") or "").strip() or None,
+                    "account_id": str(result.get("account_id") or "").strip() or None,
+                    "email": str(result.get("email") or email or "").strip() or None,
                     "last_relogin_error": None,
                     "last_relogin_error_at": None,
                 }, quiet=True)
@@ -1008,6 +1023,9 @@ class AccountService:
                     methods_tried=methods_tried,
                     old_token=anonymize_token(access_token),
                     new_token=anonymize_token(new_access_token or new_token),
+                    has_refresh_token=bool(new_refresh_token),
+                    has_session_token=bool(result.get("session_token")),
+                    source_type=result.get("source_type"),
                     expires_at=expiry.get("expires_at"),
                     expires_at_text=expiry.get("expires_at_text"),
                     expires_in_seconds=expiry.get("expires_in_seconds"),
@@ -1678,6 +1696,144 @@ class AccountService:
         )
         return {"ok": True, "detail": data}
 
+
+    def _obtain_platform_tokens_via_session(
+        self,
+        session,
+        *,
+        email: str = "",
+        user_agent: str = "",
+    ) -> dict[str, str]:
+        """用已登录 session 走 Platform OAuth + PKCE，尽量换出 refresh_token。
+
+        重登主路径拿的是 ChatGPT Web session，通常没有 RT。
+        登录态 cookie 仍在时，再起一轮 platform authorize 往往可直接下发 code。
+        """
+        if session is None:
+            return {}
+        from urllib.parse import parse_qs, urlencode, urlparse
+        from utils.pkce import generate_pkce
+
+        ua = str(user_agent or self._OAUTH_USER_AGENT)
+        verifier, challenge = generate_pkce()
+        state = secrets.token_urlsafe(24)
+        device_id = str(uuid.uuid4())
+        redirect_uri = "https://platform.openai.com/auth/callback"
+        auth_base = "https://auth.openai.com"
+        params = {
+            "client_id": self._OAUTH_CLIENT_ID,
+            "audience": "https://api.openai.com/v1",
+            "redirect_uri": redirect_uri,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "screen_hint": "login",
+            "prompt": "none",
+            "device_id": device_id,
+            "max_age": "0",
+        }
+        if email:
+            params["login_hint"] = email
+        authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+        self._relogin_trace(
+            "platform_oauth_begin",
+            email=email,
+            authorize_prefix=authorize_url[:120],
+        )
+        try:
+            resp = session.get(
+                authorize_url,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "user-agent": ua,
+                    "referer": "https://chatgpt.com/",
+                },
+                allow_redirects=True,
+                timeout=60,
+            )
+        except Exception as exc:
+            self._relogin_trace("platform_oauth_authorize_exception", email=email, error=str(exc))
+            return {}
+
+        final_url = str(getattr(resp, "url", "") or "")
+        code = ""
+        try:
+            query = parse_qs(urlparse(final_url).query)
+            code = str((query.get("code") or [""])[0] or "").strip()
+        except Exception:
+            code = ""
+        if not code:
+            # 有些实现把 code 放在 Location / 文本里
+            text = str(getattr(resp, "text", "") or "")
+            if "code=" in final_url:
+                code = str((parse_qs(urlparse(final_url).query).get("code") or [""])[0] or "").strip()
+            elif "code=" in text:
+                try:
+                    from re import search
+                    m = search(r"[?&]code=([A-Za-z0-9._\-]+)", text)
+                    if m:
+                        code = m.group(1)
+                except Exception:
+                    pass
+        if not code:
+            self._relogin_trace(
+                "platform_oauth_no_code",
+                email=email,
+                status=getattr(resp, "status_code", None),
+                final_url=final_url[:220],
+            )
+            return {}
+
+        try:
+            token_resp = session.post(
+                f"{auth_base}/api/accounts/oauth/token",
+                headers={
+                    "accept": "*/*",
+                    "content-type": "application/json",
+                    "origin": "https://platform.openai.com",
+                    "referer": "https://platform.openai.com/",
+                    "user-agent": ua,
+                },
+                json={
+                    "client_id": self._OAUTH_CLIENT_ID,
+                    "code_verifier": verifier,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+                timeout=60,
+            )
+            data = token_resp.json() if getattr(token_resp, "text", None) else {}
+        except Exception as exc:
+            self._relogin_trace("platform_oauth_token_exception", email=email, error=str(exc))
+            return {}
+
+        if getattr(token_resp, "status_code", 0) != 200 or not isinstance(data, dict) or not data.get("access_token"):
+            self._relogin_trace(
+                "platform_oauth_token_failed",
+                email=email,
+                status=getattr(token_resp, "status_code", None),
+                detail=data if isinstance(data, dict) else {},
+            )
+            return {}
+
+        out = {
+            "access_token": str(data.get("access_token") or "").strip(),
+            "refresh_token": str(data.get("refresh_token") or "").strip(),
+            "id_token": str(data.get("id_token") or "").strip(),
+        }
+        self._relogin_trace(
+            "platform_oauth_token_ok",
+            email=email,
+            has_refresh_token=bool(out["refresh_token"]),
+            has_id_token=bool(out["id_token"]),
+        )
+        return {k: v for k, v in out.items() if v}
+
+
     def _build_login_token_result(
         self,
         session,
@@ -1724,7 +1880,7 @@ class AccountService:
             refresh = str(session_creds.get("refresh_token") or refresh_token or "").strip()
             idt = str(session_creds.get("id_token") or id_token or "").strip()
             jwt_payload = self._decode_jwt_payload(access)
-            return {
+            result = {
                 "ok": True,
                 "email": str(session_creds.get("email") or email).strip(),
                 "account_id": str(session_creds.get("account_id") or "").strip(),
@@ -1736,6 +1892,20 @@ class AccountService:
                 "source_type": "chatgpt_session",
                 "raw_session": session_creds.get("raw_session") or {},
             }
+            if not result["refresh_token"] and session is not None:
+                platform_tokens = self._obtain_platform_tokens_via_session(
+                    session,
+                    email=str(result.get("email") or email),
+                    user_agent=ua,
+                )
+                if platform_tokens.get("refresh_token"):
+                    result["refresh_token"] = platform_tokens["refresh_token"]
+                if platform_tokens.get("id_token") and not result.get("id_token"):
+                    result["id_token"] = platform_tokens["id_token"]
+                # 保留 web access_token（chatgpt claims 更全）；仅补 RT/IDT
+                if platform_tokens.get("refresh_token"):
+                    result["source_type"] = "chatgpt_session+platform_rt"
+            return result
 
         # fallback: oauth / provided tokens
         access_token = str(access_token or "").strip()
@@ -1778,7 +1948,7 @@ class AccountService:
             account_id=account_id_from_jwt or str(account_info.get("account_id") or ""),
             session_error=str((session_creds or {}).get("error") or ""),
         )
-        return {
+        result = {
             "ok": True,
             "email": email_from_jwt or email,
             "account_id": account_id_from_jwt or account_info.get("account_id", ""),
@@ -1789,6 +1959,19 @@ class AccountService:
             "expires_at": jwt_payload.get("exp"),
             "source_type": source_type,
         }
+        if not result["refresh_token"] and session is not None:
+            platform_tokens = self._obtain_platform_tokens_via_session(
+                session,
+                email=str(result.get("email") or email),
+                user_agent=ua,
+            )
+            if platform_tokens.get("refresh_token"):
+                result["refresh_token"] = platform_tokens["refresh_token"]
+            if platform_tokens.get("id_token") and not result.get("id_token"):
+                result["id_token"] = platform_tokens["id_token"]
+            if platform_tokens.get("refresh_token"):
+                result["source_type"] = f"{source_type}+platform_rt"
+        return result
 
 
     def _bootstrap_chatgpt_web_authorize(
