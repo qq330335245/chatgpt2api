@@ -1697,6 +1697,7 @@ class AccountService:
         return {"ok": True, "detail": data}
 
 
+
     def _obtain_platform_tokens_via_session(
         self,
         session,
@@ -1715,123 +1716,202 @@ class AccountService:
         from utils.pkce import generate_pkce
 
         ua = str(user_agent or self._OAUTH_USER_AGENT)
-        verifier, challenge = generate_pkce()
-        state = secrets.token_urlsafe(24)
-        device_id = str(uuid.uuid4())
         redirect_uri = "https://platform.openai.com/auth/callback"
         auth_base = "https://auth.openai.com"
-        params = {
-            "client_id": self._OAUTH_CLIENT_ID,
-            "audience": "https://api.openai.com/v1",
-            "redirect_uri": redirect_uri,
-            "scope": "openid profile email offline_access",
-            "response_type": "code",
-            "response_mode": "query",
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "screen_hint": "login",
-            "prompt": "none",
-            "device_id": device_id,
-            "max_age": "0",
-        }
-        if email:
-            params["login_hint"] = email
-        authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-        self._relogin_trace(
-            "platform_oauth_begin",
-            email=email,
-            authorize_prefix=authorize_url[:120],
-        )
-        try:
-            resp = session.get(
-                authorize_url,
-                headers={
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "user-agent": ua,
-                    "referer": "https://chatgpt.com/",
-                },
-                allow_redirects=True,
-                timeout=60,
-            )
-        except Exception as exc:
-            self._relogin_trace("platform_oauth_authorize_exception", email=email, error=str(exc))
-            return {}
+        platform_base = "https://platform.openai.com"
 
-        final_url = str(getattr(resp, "url", "") or "")
-        code = ""
-        try:
-            query = parse_qs(urlparse(final_url).query)
-            code = str((query.get("code") or [""])[0] or "").strip()
-        except Exception:
+        def _extract_code(resp) -> str:
+            final_url = str(getattr(resp, "url", "") or "")
             code = ""
-        if not code:
-            # 有些实现把 code 放在 Location / 文本里
-            text = str(getattr(resp, "text", "") or "")
-            if "code=" in final_url:
+            try:
                 code = str((parse_qs(urlparse(final_url).query).get("code") or [""])[0] or "").strip()
-            elif "code=" in text:
+            except Exception:
+                code = ""
+            if code:
+                return code
+            text_body = str(getattr(resp, "text", "") or "")
+            for candidate in (final_url, text_body):
+                if "code=" not in candidate:
+                    continue
                 try:
                     from re import search
-                    m = search(r"[?&]code=([A-Za-z0-9._\-]+)", text)
+                    m = search(r"[?&]code=([A-Za-z0-9._\-]+)", candidate)
                     if m:
-                        code = m.group(1)
+                        return str(m.group(1) or "").strip()
                 except Exception:
                     pass
-        if not code:
+            # sometimes JSON continue_url
+            try:
+                payload = resp.json() if getattr(resp, "text", None) else {}
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                cont = str(payload.get("continue_url") or "")
+                if "code=" in cont:
+                    try:
+                        return str((parse_qs(urlparse(cont).query).get("code") or [""])[0] or "").strip()
+                    except Exception:
+                        return ""
+            return ""
+
+        def _exchange(code: str, verifier: str) -> dict[str, str]:
+            try:
+                token_resp = session.post(
+                    f"{auth_base}/api/accounts/oauth/token",
+                    headers={
+                        "accept": "*/*",
+                        "content-type": "application/json",
+                        "origin": platform_base,
+                        "referer": f"{platform_base}/",
+                        "user-agent": ua,
+                    },
+                    json={
+                        "client_id": self._OAUTH_CLIENT_ID,
+                        "code_verifier": verifier,
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    timeout=60,
+                )
+                data = token_resp.json() if getattr(token_resp, "text", None) else {}
+            except Exception as exc:
+                self._relogin_trace("platform_oauth_token_exception", email=email, error=str(exc))
+                return {}
+            if getattr(token_resp, "status_code", 0) != 200 or not isinstance(data, dict) or not data.get("access_token"):
+                self._relogin_trace(
+                    "platform_oauth_token_failed",
+                    email=email,
+                    status=getattr(token_resp, "status_code", None),
+                    detail=data if isinstance(data, dict) else {},
+                )
+                return {}
+            out = {
+                "access_token": str(data.get("access_token") or "").strip(),
+                "refresh_token": str(data.get("refresh_token") or "").strip(),
+                "id_token": str(data.get("id_token") or "").strip(),
+            }
             self._relogin_trace(
-                "platform_oauth_no_code",
+                "platform_oauth_token_ok",
                 email=email,
-                status=getattr(resp, "status_code", None),
-                final_url=final_url[:220],
+                has_refresh_token=bool(out["refresh_token"]),
+                has_id_token=bool(out["id_token"]),
             )
-            return {}
+            return {k: v for k, v in out.items() if v}
 
-        try:
-            token_resp = session.post(
-                f"{auth_base}/api/accounts/oauth/token",
-                headers={
-                    "accept": "*/*",
-                    "content-type": "application/json",
-                    "origin": "https://platform.openai.com",
-                    "referer": "https://platform.openai.com/",
-                    "user-agent": ua,
-                },
-                json={
-                    "client_id": self._OAUTH_CLIENT_ID,
-                    "code_verifier": verifier,
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": redirect_uri,
-                },
-                timeout=60,
-            )
-            data = token_resp.json() if getattr(token_resp, "text", None) else {}
-        except Exception as exc:
-            self._relogin_trace("platform_oauth_token_exception", email=email, error=str(exc))
-            return {}
-
-        if getattr(token_resp, "status_code", 0) != 200 or not isinstance(data, dict) or not data.get("access_token"):
+        # prompt=none 在 web-session 场景常直接 AuthApiFailure；再降级到可交互 authorize
+        attempt_defs = [
+            {"name": "prompt_none", "prompt": "none", "screen_hint": "login", "max_age": "0"},
+            {"name": "login_no_prompt", "screen_hint": "login"},
+            {"name": "login_or_signup", "screen_hint": "login_or_signup"},
+        ]
+        for attempt in attempt_defs:
+            verifier, challenge = generate_pkce()
+            state = secrets.token_urlsafe(24)
+            device_id = str(uuid.uuid4())
+            params = {
+                "client_id": self._OAUTH_CLIENT_ID,
+                "audience": "https://api.openai.com/v1",
+                "redirect_uri": redirect_uri,
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "device_id": device_id,
+            }
+            if attempt.get("screen_hint"):
+                params["screen_hint"] = attempt["screen_hint"]
+            if attempt.get("prompt"):
+                params["prompt"] = attempt["prompt"]
+            if attempt.get("max_age") is not None:
+                params["max_age"] = attempt["max_age"]
+            if email:
+                params["login_hint"] = email
+            authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
             self._relogin_trace(
-                "platform_oauth_token_failed",
+                "platform_oauth_begin",
                 email=email,
-                status=getattr(token_resp, "status_code", None),
-                detail=data if isinstance(data, dict) else {},
+                attempt=attempt.get("name"),
+                authorize_prefix=authorize_url[:140],
             )
-            return {}
+            try:
+                resp = session.get(
+                    authorize_url,
+                    headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "user-agent": ua,
+                        "referer": "https://chatgpt.com/",
+                    },
+                    allow_redirects=True,
+                    timeout=60,
+                )
+            except Exception as exc:
+                self._relogin_trace(
+                    "platform_oauth_authorize_exception",
+                    email=email,
+                    attempt=attempt.get("name"),
+                    error=str(exc),
+                )
+                continue
 
-        out = {
-            "access_token": str(data.get("access_token") or "").strip(),
-            "refresh_token": str(data.get("refresh_token") or "").strip(),
-            "id_token": str(data.get("id_token") or "").strip(),
-        }
-        self._relogin_trace(
-            "platform_oauth_token_ok",
-            email=email,
-            has_refresh_token=bool(out["refresh_token"]),
-            has_id_token=bool(out["id_token"]),
-        )
-        return {k: v for k, v in out.items() if v}
+            code = _extract_code(resp)
+            final_url = str(getattr(resp, "url", "") or "")
+            if not code and "error" not in final_url:
+                # 可能停在登录中间页：尝试 authorize/continue
+                try:
+                    cont = session.post(
+                        f"{auth_base}/api/accounts/authorize/continue",
+                        headers={
+                            "accept": "application/json",
+                            "content-type": "application/json",
+                            "origin": auth_base,
+                            "referer": final_url or f"{auth_base}/",
+                            "user-agent": ua,
+                            "oai-device-id": device_id,
+                        },
+                        json={"username": {"value": email, "kind": "email"}, "screen_hint": attempt.get("screen_hint") or "login"},
+                        timeout=30,
+                    )
+                    code = _extract_code(cont) or code
+                    if not code:
+                        try:
+                            detail = cont.json() if cont.text else {}
+                        except Exception:
+                            detail = {}
+                        cont_url = str((detail or {}).get("continue_url") or "")
+                        if cont_url.startswith("http"):
+                            follow = session.get(
+                                cont_url,
+                                headers={"accept": "text/html", "user-agent": ua},
+                                allow_redirects=True,
+                                timeout=60,
+                            )
+                            code = _extract_code(follow) or code
+                            final_url = str(getattr(follow, "url", "") or final_url)
+                except Exception as exc:
+                    self._relogin_trace(
+                        "platform_oauth_continue_exception",
+                        email=email,
+                        attempt=attempt.get("name"),
+                        error=str(exc),
+                    )
+
+            if not code:
+                self._relogin_trace(
+                    "platform_oauth_no_code",
+                    email=email,
+                    attempt=attempt.get("name"),
+                    status=getattr(resp, "status_code", None),
+                    final_url=final_url[:220],
+                )
+                continue
+
+            tokens = _exchange(code, verifier)
+            if tokens.get("refresh_token") or tokens.get("access_token"):
+                return tokens
+        return {}
 
 
     def _build_login_token_result(
