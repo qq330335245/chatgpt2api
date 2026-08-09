@@ -7,7 +7,9 @@
       "label": "CF Temp Mail",
       "api_base": "https://your-worker.example.com",
       "admin_password": "YOUR_ADMIN_PASSWORD",
-      "domain": ["your-domain.com"],
+      "domain": [
+        "your-domain.com"
+      ],
       "inbox_address": "catch@your-domain.com"
     },
     {
@@ -24,20 +26,32 @@
       "provider_ref": "icloud1",
       "type": "icloud",
       "enable": true,
-      "label": "iCloud IMAP",
+      "label": "iCloud HME + CF forward",
+      "connection_mode": "temp_mail",
+      "icloud_cookies": "X-APPLE-WEBAUTH-USER=...; X-APPLE-WEBAUTH-TOKEN=...; X-APPLE-DS-WEB-SESSION-TOKEN=...",
+      "temp_mail_type": "cloudflare_temp_email",
+      "temp_mail_provider_ref": "cf1",
+      "temp_mail_target_email": "catch@your-domain.com",
+      "platform": "chatgpt",
+      "icloud_alias_label": "chatgpt",
+      "reuse_aliases": true,
+      "create_when_exhausted": true,
+      "cloud_mark": true,
+      "coordination_mode": "local_fast",
+      "async_mark": true,
+      "background_replenish": true,
+      "low_watermark": 5,
+      "high_watermark": 20,
+      "inventory_path": "icloud_alias_inventory.db"
+    },
+    {
+      "provider_ref": "icloud_imap",
+      "type": "icloud",
+      "enable": false,
+      "label": "iCloud IMAP shared mailbox",
       "connection_mode": "imap",
       "shared_email": "you@icloud.com",
       "shared_password": "app-specific-password"
-    },
-    {
-      "provider_ref": "icloud_cf",
-      "type": "icloud",
-      "enable": false,
-      "label": "iCloud via CF forward",
-      "connection_mode": "temp_mail",
-      "temp_mail_type": "cloudflare_temp_email",
-      "temp_mail_provider_ref": "cf1",
-      "temp_mail_target_email": "catch@your-domain.com"
     }
   ],
   "wait_timeout": 120,

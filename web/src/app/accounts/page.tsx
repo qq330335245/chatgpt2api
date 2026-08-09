@@ -112,7 +112,7 @@ function buildMailProviderOptions(providers: Array<Record<string, unknown>>): Ma
     const cnt = (counters[type] || 0) + 1;
     counters[type] = cnt;
     const provider_ref = `${type}#${idx}`;
-    const label = type === "ddg_mail" ? `DDG-${cnt}` : provider_ref;
+    const label = type === "ddg_mail" ? `DDG-${cnt}` : type === "icloud" ? `iCloud-${provider_ref}` : provider_ref;
     return {
       provider_ref,
       type,

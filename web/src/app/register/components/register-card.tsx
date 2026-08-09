@@ -19,6 +19,7 @@ export function RegisterCard() {
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
   const setMode = useSettingsStore((state) => state.setRegisterMode);
+  const setRegisterFlow = useSettingsStore((state) => state.setRegisterFlow);
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
@@ -60,6 +61,28 @@ export function RegisterCard() {
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
       ...(type === "mail_2925" ? { main_email: "", main_password: "", imap_host: "imap.2925.com", imap_port: 993, alias_length: 4, alias_segments: 1, fixed_prefix_enabled: false, fixed_prefix: "", message_limit: 40 } : {}),
+      ...(type === "icloud" ? {
+        connection_mode: "temp_mail",
+        icloud_cookies: "",
+        temp_mail_type: "cloudflare_temp_email",
+        temp_mail_provider_ref: "",
+        temp_mail_target_email: "",
+        shared_email: "",
+        shared_password: "",
+        imap_host: "imap.mail.me.com",
+        imap_port: 993,
+        platform: "chatgpt",
+        icloud_alias_label: "chatgpt",
+        reuse_aliases: true,
+        create_when_exhausted: true,
+        cloud_mark: true,
+        coordination_mode: "local_fast",
+        async_mark: true,
+        background_replenish: true,
+        low_watermark: 5,
+        high_watermark: 20,
+        inventory_path: "icloud_alias_inventory.db",
+      } : {}),
     });
   };
 
@@ -87,6 +110,25 @@ export function RegisterCard() {
           </div>
 
           <div className="grid gap-4 md:grid-cols-3">
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">注册流程</label>
+              <Select
+                value={config.register_flow === "passwordless" ? "passwordless" : "legacy"}
+                onValueChange={(value) => setRegisterFlow(value as "legacy" | "passwordless")}
+                disabled={config.enabled}
+              >
+                <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="legacy">旧流程（设密码 + OTP）</SelectItem>
+                  <SelectItem value="passwordless">新流程（Passwordless 官网路径）</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs leading-5 text-stone-500">
+                新流程对齐最新官网 HAR：login_or_signup → 邮箱 OTP → about-you，并携带 sentinel SO token。
+              </p>
+            </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册模式</label>
               <Select value={config.mode || "total"} onValueChange={(value) => setMode(value as "total" | "quota" | "available")} disabled={config.enabled}>
@@ -197,6 +239,7 @@ export function RegisterCard() {
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
                             <SelectItem value="mail_2925">mail_2925 (2925.com IMAP 别名)</SelectItem>
+                            <SelectItem value="icloud">icloud (Hide My Email 租约 + CF/IMAP 收信)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -358,6 +401,109 @@ export function RegisterCard() {
                           <div className="space-y-2">
                             <label className="text-sm text-stone-700">固定前缀</label>
                             <Input value={String(provider.fixed_prefix || "")} onChange={(event) => updateProvider(index, { fixed_prefix: event.target.value, fixed_prefix_enabled: Boolean(event.target.value) })} placeholder="fa" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                        </>
+                      ) : null}
+                      {type === "icloud" ? (
+                        <>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">收信模式</label>
+                            <Select value={String(provider.connection_mode || "temp_mail")} onValueChange={(value) => updateProvider(index, { connection_mode: value })} disabled={config.enabled}>
+                              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="temp_mail">temp_mail（HME 租约 + CF 转发，推荐）</SelectItem>
+                                <SelectItem value="imap">imap（共享 iCloud IMAP 过滤别名）</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">iCloud Cookies（创建/租约 Hide My Email 必填）</label>
+                            <Textarea
+                              value={String(provider.icloud_cookies || provider.cookies || "")}
+                              onChange={(event) => updateProvider(index, { icloud_cookies: event.target.value })}
+                              placeholder={"从 icloud.com 登录后复制 Cookie\n至少包含 X-APPLE-WEBAUTH-USER / TOKEN / DS-WEB-SESSION-TOKEN"}
+                              className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs"
+                              disabled={config.enabled}
+                            />
+                            <p className="text-xs text-stone-500">库存文件默认 data/icloud_alias_inventory.db，平台标签默认 chatgpt。</p>
+                          </div>
+                          {String(provider.connection_mode || "temp_mail") !== "imap" ? (
+                            <>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">HME 转发目标（CF 收件箱）</label>
+                                <Input value={String(provider.temp_mail_target_email || "")} onChange={(event) => updateProvider(index, { temp_mail_target_email: event.target.value })} placeholder="apple@your-domain.com" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">转发邮服类型</label>
+                                <Input value={String(provider.temp_mail_type || "cloudflare_temp_email")} onChange={(event) => updateProvider(index, { temp_mail_type: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">转发邮服 provider_ref（可选）</label>
+                                <Input value={String(provider.temp_mail_provider_ref || "")} onChange={(event) => updateProvider(index, { temp_mail_provider_ref: event.target.value })} placeholder="cf1 或 cloudflare_temp_email#1" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">共享 iCloud 邮箱</label>
+                                <Input value={String(provider.shared_email || "")} onChange={(event) => updateProvider(index, { shared_email: event.target.value })} placeholder="you@icloud.com" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">App 专用密码</label>
+                                <Input type="password" value={String(provider.shared_password || "")} onChange={(event) => updateProvider(index, { shared_password: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">IMAP Host</label>
+                                <Input value={String(provider.imap_host || "imap.mail.me.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">IMAP Port</label>
+                                <Input value={String(provider.imap_port ?? 993)} onChange={(event) => updateProvider(index, { imap_port: Number(event.target.value) || 993 })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                            </>
+                          )}
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">平台标签 platform</label>
+                            <Input value={String(provider.platform || "chatgpt")} onChange={(event) => updateProvider(index, { platform: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">HME label</label>
+                            <Input value={String(provider.icloud_alias_label || "chatgpt")} onChange={(event) => updateProvider(index, { icloud_alias_label: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">低水位</label>
+                            <Input value={String(provider.low_watermark ?? 5)} onChange={(event) => updateProvider(index, { low_watermark: Number(event.target.value) || 5 })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">高水位</label>
+                            <Input value={String(provider.high_watermark ?? 20)} onChange={(event) => updateProvider(index, { high_watermark: Number(event.target.value) || 20 })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">库存文件 inventory_path</label>
+                            <Input value={String(provider.inventory_path || "icloud_alias_inventory.db")} onChange={(event) => updateProvider(index, { inventory_path: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="flex flex-wrap gap-4 pt-1 text-sm text-stone-700">
+                            <label className="inline-flex items-center gap-2">
+                              <Checkbox checked={Boolean(provider.reuse_aliases ?? true)} onCheckedChange={(checked) => updateProvider(index, { reuse_aliases: Boolean(checked) })} disabled={config.enabled} />
+                              复用未注册别名
+                            </label>
+                            <label className="inline-flex items-center gap-2">
+                              <Checkbox checked={Boolean(provider.create_when_exhausted ?? true)} onCheckedChange={(checked) => updateProvider(index, { create_when_exhausted: Boolean(checked) })} disabled={config.enabled} />
+                              库存耗尽自动创建
+                            </label>
+                            <label className="inline-flex items-center gap-2">
+                              <Checkbox checked={Boolean(provider.cloud_mark ?? true)} onCheckedChange={(checked) => updateProvider(index, { cloud_mark: Boolean(checked) })} disabled={config.enabled} />
+                              成功写 HME note
+                            </label>
+                            <label className="inline-flex items-center gap-2">
+                              <Checkbox checked={Boolean(provider.background_replenish ?? true)} onCheckedChange={(checked) => updateProvider(index, { background_replenish: Boolean(checked) })} disabled={config.enabled} />
+                              后台低水位补货
+                            </label>
+                          </div>
+                          <div className="rounded-xl border border-sky-100 bg-sky-50/70 px-3 py-2 text-xs leading-5 text-sky-900">
+                            注册时租借/创建 Hide My Email 别名；OTP 按 X-ICLOUD-HME 匹配。请同时配置并启用 cloudflare_temp_email 作为转发收信。
                           </div>
                         </>
                       ) : null}

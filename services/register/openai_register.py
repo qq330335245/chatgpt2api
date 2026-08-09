@@ -37,11 +37,19 @@ config = {
     "proxy": "",
     "total": 10,
     "threads": 3,
+    # register_flow: legacy | passwordless
+    "register_flow": "legacy",
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
+    config.update(
+        {
+            key: saved_config[key]
+            for key in ("mail", "proxy", "total", "threads", "register_flow")
+            if key in saved_config
+        }
+    )
 except Exception:
     pass
 
@@ -803,11 +811,26 @@ class PlatformRegistrar:
         }
 
 
+def _resolve_register_flow() -> str:
+    flow = str(config.get("register_flow") or "legacy").strip().lower()
+    if flow in {"passwordless", "passwordless_signup", "official", "new"}:
+        return "passwordless"
+    return "legacy"
+
+
 def worker(index: int) -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+    flow = _resolve_register_flow()
+    if flow == "passwordless":
+        from services.register.passwordless_register import PasswordlessRegistrar
+
+        registrar = PasswordlessRegistrar(config["proxy"])
+        flow_label = "passwordless"
+    else:
+        registrar = PlatformRegistrar(config["proxy"])
+        flow_label = "legacy"
     try:
-        step(index, "任务启动")
+        step(index, f"任务启动[{flow_label}]")
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])

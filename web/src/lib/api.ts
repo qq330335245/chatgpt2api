@@ -355,6 +355,8 @@ export type RegisterConfig = {
   total: number;
   threads: number;
   mode: "total" | "quota" | "available";
+  // legacy: password register path; passwordless: official HAR path
+  register_flow?: "legacy" | "passwordless";
   target_quota: number;
   target_available: number;
   check_interval: number;

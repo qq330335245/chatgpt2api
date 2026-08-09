@@ -344,6 +344,7 @@ class ChatGPTWebEntry:
         timeout: float = 30,
         verbose: bool = False,
         screen_hint: str = "signup",
+        extra_query: dict[str, str] | None = None,
     ):
         self.email = str(email or "").strip()
         self.proxy = str(proxy or "").strip()
@@ -351,6 +352,11 @@ class ChatGPTWebEntry:
         self.verbose = bool(verbose)
         self.timeout = float(timeout or 30)
         self.screen_hint = str(screen_hint or "signup").strip() or "signup"
+        self.extra_query = {
+            str(k): str(v)
+            for k, v in dict(extra_query or {}).items()
+            if str(k or "").strip() and str(v or "").strip()
+        }
         self.profile = _pick_profile()
         self.session = self._build_session()
         self.device_id = ""
@@ -534,6 +540,8 @@ class ChatGPTWebEntry:
             "screen_hint": self.screen_hint,
             "login_hint": self.email,
         }
+        if self.extra_query:
+            query.update(self.extra_query)
         signin_url = f"{CHATGPT_BASE}/api/auth/signin/openai?{urlencode(query)}"
         headers = self._api_headers(referer=f"{CHATGPT_BASE}/", origin=CHATGPT_BASE)
         headers["Content-Type"] = "application/x-www-form-urlencoded"

@@ -331,10 +331,19 @@ def _message_matches_email(data: dict[str, Any], email: str) -> bool:
 
     代收场景（iCloud Hide My Email 等转发到 CF 统一收件箱）下，
     CF 的 to 可能是 catch-all，原别名常出现在 raw/正文/自定义字段中。
+    若存在 X-ICLOUD-HME p= 头，则只按该头严格匹配，避免 catch-all 串信。
     """
     target = str(email or "").strip().lower()
     if not target:
         return True
+    try:
+        from services.register.icloud_mail import extract_x_icloud_hme_alias
+
+        hme_alias = extract_x_icloud_hme_alias(data)
+        if hme_alias:
+            return hme_alias == target
+    except Exception:
+        pass
     candidates: list[str] = []
     for key in ("to", "toEmail", "mailTo", "receiver", "receivers", "address", "email", "envelope_to", "target", "recipient", "original_to"):
         if key in data:
@@ -2320,10 +2329,41 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态。
 
-    仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
-    其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
+    - outlook_token: 成功 used；token 失效 token_invalid；其它 failed
+    - icloud: 成功 commit 租约/写 note；失败 release+cooldown
     """
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+    provider_name = str(mailbox.get("provider") or "").strip()
+    if provider_name in {"icloud", "icloud_hme", "apple"}:
+        from services.register.icloud_mail import ICloudMailProvider
+
+        entry = {
+            "provider_ref": str(mailbox.get("provider_ref") or ""),
+            "type": "icloud",
+            "icloud_cookies": str(mailbox.get("icloud_cookies") or ""),
+            "inventory_path": str(mailbox.get("icloud_inventory_path") or ""),
+            "platform": str(mailbox.get("icloud_platform") or "chatgpt"),
+            "label": str(mailbox.get("icloud_label") or "chatgpt"),
+            "connection_mode": str(mailbox.get("icloud_mode") or "temp_mail"),
+            "cloud_mark": True,
+            "coordination_mode": "local_fast",
+        }
+        conf = {
+            "wait_timeout": 1,
+            "wait_interval": 1,
+            "request_timeout": 15,
+            "user_agent": "chatgpt2api",
+        }
+        provider = ICloudMailProvider(entry, conf)
+        try:
+            provider.mark_result(mailbox, success=success, error=error)
+        finally:
+            try:
+                provider.close()
+            except Exception:
+                pass
+        return
+
+    if provider_name != OutlookTokenProvider.name:
         return
     address = str(mailbox.get("address") or "").strip()
     if not address:
@@ -2339,8 +2379,12 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
 
 
 def release_mailbox(mailbox: dict) -> None:
-    """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+    """释放未完成注册的邮箱占用（outlook_token / icloud lease）。"""
+    provider_name = str(mailbox.get("provider") or "").strip()
+    if provider_name in {"icloud", "icloud_hme", "apple"}:
+        mark_mailbox_result(mailbox, success=False, error="released")
+        return
+    if provider_name != OutlookTokenProvider.name:
         return
     _release_outlook_token_state(str(mailbox.get("address") or ""))
 

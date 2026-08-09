@@ -101,6 +101,7 @@ _FLOW_PAGE_URLS = {
     "username_password_create": "https://auth.openai.com/create-account/password",
     "password_verify": "https://auth.openai.com/log-in/password",
     "authorize_continue": "https://auth.openai.com/",
+    "email_otp_validate": "https://auth.openai.com/email-verification",
 }
 
 
@@ -159,8 +160,9 @@ def build_sentinel_token_via_node(
     user_agent: str = "",
     page_url: str = "",
     timeout_seconds: int = 70,
-) -> tuple[str, str]:
-    """???? Sentinel SDK?Node ????????? t ??? token?"""
+    with_so: bool = False,
+) -> tuple[str, str, str, list[str]]:
+    """Run Sentinel SDK in Node and return (token, oai_sc, so_token, set_cookies)."""
     script = _node_probe_script()
     if not script.exists():
         raise FileNotFoundError(f"missing sentinel node probe: {script}")
@@ -174,6 +176,9 @@ def build_sentinel_token_via_node(
         str(device_id or "").strip(),
         "--full",
     ]
+    if with_so:
+        command.append("--with-so")
+        command.append("--bundle-output")
     resolved_page_url = _page_url_for_flow(flow, page_url)
     if resolved_page_url:
         command.extend(["--page-url", resolved_page_url])
@@ -200,10 +205,20 @@ def build_sentinel_token_via_node(
     if not isinstance(payload, dict):
         raise RuntimeError("sentinel_node_probe_invalid_payload")
 
-    # ???? --bundle-output ?? {token: "..."} ????
+    set_cookies: list[str] = []
+    so_token = ""
+    raw_set = payload.get("sentinel_req_set_cookies")
+    if isinstance(raw_set, list):
+        set_cookies = [str(item) for item in raw_set if str(item or "").strip()]
+
+    # Bundle output: {token, session_observer_token, sentinel_req_set_cookies}
     if "token" in payload and not payload.get("p"):
         token_raw = str(payload.get("token") or "").strip()
-        payload = json.loads(token_raw)
+        so_token = str(payload.get("session_observer_token") or "").strip()
+        try:
+            payload = json.loads(token_raw)
+        except Exception as exc:
+            raise RuntimeError(f"sentinel_node_probe_invalid_token_json: {token_raw[:200]}") from exc
 
     if not isinstance(payload, dict):
         raise RuntimeError("sentinel_node_probe_invalid_token_object")
@@ -214,8 +229,18 @@ def build_sentinel_token_via_node(
     if not str(payload.get("flow") or "").strip():
         payload["flow"] = flow
 
+    # Prefer real Set-Cookie oai-sc when Node captured it.
+    oai_sc = ""
+    for item in set_cookies:
+        first = str(item or "").split(";", 1)[0].strip()
+        if first.lower().startswith("oai-sc="):
+            oai_sc = first.split("=", 1)[1].strip()
+            break
+    if not oai_sc:
+        oai_sc = _oai_sc_from_token_payload(payload)
+
     sentinel_value = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    return sentinel_value, _oai_sc_from_token_payload(payload)
+    return sentinel_value, oai_sc, so_token, set_cookies
 
 
 def build_sentinel_token_python(
@@ -302,12 +327,14 @@ def build_sentinel_token(
     use_node = _truthy_env("SENTINEL_USE_NODE", True) if prefer_node is None else bool(prefer_node)
     if use_node:
         try:
-            return build_sentinel_token_via_node(
+            token, oai_sc, _so_token, _set_cookies = build_sentinel_token_via_node(
                 device_id,
                 flow,
                 user_agent=user_agent or DEFAULT_SENTINEL_USER_AGENT,
                 page_url=page_url,
+                with_so=False,
             )
+            return token, oai_sc
         except Exception:
             # ?????????????? prefer_node=True ?????
             if prefer_node is True:
@@ -320,3 +347,72 @@ def build_sentinel_token(
         user_agent=user_agent,
         sec_ch_ua=sec_ch_ua,
     )
+
+def build_sentinel_token_bundle(
+    session: "Session",
+    device_id: str,
+    flow: str,
+    *,
+    user_agent: str = "",
+    sec_ch_ua: str = "",
+    page_url: str = "",
+    prefer_node: bool | None = None,
+    with_so: bool = False,
+    require_real_t: bool = False,
+) -> dict[str, Any]:
+    """Return token bundle for auth requests.
+
+    Keys:
+      - token: openai-sentinel-token JSON string
+      - so_token: openai-sentinel-so-token JSON string (optional)
+      - oai_sc: cookie value if known
+      - set_cookies: raw Set-Cookie lines from sentinel/req when available
+    """
+    use_node = _truthy_env("SENTINEL_USE_NODE", True) if prefer_node is None else bool(prefer_node)
+    if with_so and not use_node:
+        raise RuntimeError("sentinel_so_token_requires_node")
+
+    if use_node:
+        try:
+            token, oai_sc, so_token, set_cookies = build_sentinel_token_via_node(
+                device_id,
+                flow,
+                user_agent=user_agent or DEFAULT_SENTINEL_USER_AGENT,
+                page_url=page_url,
+                with_so=with_so,
+            )
+            if require_real_t:
+                payload = json.loads(token)
+                if not str((payload or {}).get("t") or "").strip():
+                    raise RuntimeError("sentinel_token_missing_t")
+            if with_so and not str(so_token or "").strip():
+                raise RuntimeError("sentinel_so_token_empty")
+            return {
+                "token": token,
+                "so_token": so_token or "",
+                "oai_sc": oai_sc or "",
+                "set_cookies": set_cookies or [],
+            }
+        except Exception:
+            if prefer_node is True or with_so or require_real_t:
+                raise
+
+    token, oai_sc = build_sentinel_token_python(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+    )
+    if require_real_t:
+        payload = json.loads(token)
+        if not str((payload or {}).get("t") or "").strip():
+            raise RuntimeError("sentinel_token_missing_t")
+    if with_so:
+        raise RuntimeError("sentinel_so_token_unavailable_python_fallback")
+    return {
+        "token": token,
+        "so_token": "",
+        "oai_sc": oai_sc or "",
+        "set_cookies": [],
+    }
