@@ -484,6 +484,14 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def image_release_memory_after_task(self) -> bool:
+        """Attempt to return unused image-task heap pages after every task."""
+        value = self.data.get("image_release_memory_after_task", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
     def image_settle_enabled(self) -> bool:
         """图片二次确认机制：找到 file_ids 后等待一段时间再次确认。"""
         value = self.data.get("image_settle_enabled", True)
@@ -609,6 +617,7 @@ class ConfigStore:
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
+        data["image_release_memory_after_task"] = self.image_release_memory_after_task
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts

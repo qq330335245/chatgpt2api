@@ -26,13 +26,44 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
-    def make_service(self, path: Path, handler=None) -> ImageTaskService:
+    def make_service(self, path: Path, handler=None, release_memory_after_task_getter=None, memory_release_callback=None) -> ImageTaskService:
         return ImageTaskService(
             path,
             generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
             retention_days_getter=lambda: 30,
+            release_memory_after_task_getter=release_memory_after_task_getter,
+            memory_release_callback=memory_release_callback or (lambda: False),
         )
+
+    def test_releases_memory_after_task_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release_calls = 0
+
+            def release_memory():
+                nonlocal release_calls
+                release_calls += 1
+                return True
+
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                release_memory_after_task_getter=lambda: True,
+                memory_release_callback=release_memory,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="release-memory-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            wait_for_task(service, OWNER, "release-memory-task", "success")
+            deadline = time.time() + 1
+            while release_calls == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(release_calls, 1)
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

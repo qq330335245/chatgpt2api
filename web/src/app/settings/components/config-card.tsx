@@ -26,6 +26,7 @@ export function ConfigCard() {
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageReleaseMemoryAfterTask = useSettingsStore((state) => state.setImageReleaseMemoryAfterTask);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
@@ -175,6 +176,16 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_release_memory_after_task)}
+                onCheckedChange={(checked) => setImageReleaseMemoryAfterTask(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">图片任务结束后释放内存</span>
+            </div>
+            <p className="text-xs text-stone-500">任务完成或失败后尝试归还空闲堆页，适合内存较小的服务器；会增加后续生图的分配开销。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

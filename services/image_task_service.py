@@ -11,6 +11,7 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
+from services.memory_release import release_process_memory
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
 TASK_STATUS_QUEUED = "queued"
@@ -104,11 +105,17 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        release_memory_after_task_getter: Callable[[], bool] | None = None,
+        memory_release_callback: Callable[[], bool] = release_process_memory,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.release_memory_after_task_getter = release_memory_after_task_getter or (
+            lambda: config.image_release_memory_after_task
+        )
+        self.memory_release_callback = memory_release_callback
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +263,8 @@ class ImageTaskService:
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
+        result: dict[str, Any] | None = None
+        data: list[Any] | None = None
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -305,6 +314,21 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+        finally:
+            # Drop request images and upstream response references before trimming.
+            payload.clear()
+            payload_with_progress.clear()
+            result = None
+            data = None
+            try:
+                should_release = self.release_memory_after_task_getter()
+            except Exception:
+                should_release = False
+            if should_release:
+                try:
+                    self.memory_release_callback()
+                except Exception:
+                    pass
 
     def _log_call(
         self,

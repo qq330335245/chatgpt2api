@@ -184,6 +184,7 @@ export type SettingsConfig = {
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
+  image_release_memory_after_task?: boolean;
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;
   image_remove_conversation_after_result?: boolean;
