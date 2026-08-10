@@ -120,7 +120,28 @@ def _node_binary() -> str:
     override = str(os.environ.get("SENTINEL_NODE_PATH") or "").strip()
     if override:
         return override
-    return shutil.which("node") or "node"
+    found = shutil.which("node")
+    if found:
+        return found
+    # Common container/local fallbacks.
+    for candidate in ("/usr/bin/node", "/usr/local/bin/node"):
+        if Path(candidate).exists():
+            return candidate
+    return "node"
+
+
+def _ensure_node_available() -> str:
+    binary = _node_binary()
+    if binary != "node" and Path(binary).exists():
+        return binary
+    resolved = shutil.which(binary) if binary else None
+    if resolved:
+        return resolved
+    raise RuntimeError(
+        "sentinel_node_not_found: passwordless 注册需要 Node.js 生成 openai-sentinel-so-token。"
+        "当前运行环境找不到 node。请使用包含 node 的镜像重建部署，"
+        "或设置 SENTINEL_NODE_PATH 指向 node 可执行文件。"
+    )
 
 
 def _truthy_env(name: str, default: bool = True) -> bool:
@@ -167,8 +188,9 @@ def build_sentinel_token_via_node(
     if not script.exists():
         raise FileNotFoundError(f"missing sentinel node probe: {script}")
 
+    node_bin = _ensure_node_available()
     command = [
-        _node_binary(),
+        node_bin,
         str(script),
         "--flow",
         str(flow or "").strip(),
@@ -185,14 +207,20 @@ def build_sentinel_token_via_node(
     if user_agent:
         command.extend(["--user-agent", user_agent])
 
-    completed = subprocess.run(
-        command,
-        cwd=str(_project_root()),
-        text=True,
-        capture_output=True,
-        timeout=max(5, int(timeout_seconds or 70)),
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(_project_root()),
+            text=True,
+            capture_output=True,
+            timeout=max(5, int(timeout_seconds or 70)),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "sentinel_node_not_found: passwordless 注册需要 Node.js，"
+            f"当前命令不可用: {command[0]!r}"
+        ) from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         raise RuntimeError(f"sentinel_node_probe_failed_{completed.returncode}: {detail[:300]}")

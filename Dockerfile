@@ -22,19 +22,26 @@ ARG TARGETARCH
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    SENTINEL_USE_NODE=1 \
+    SENTINEL_NODE_PATH=node
 
 WORKDIR /app
 
 # 安装系统依赖
-# - git: Git 存储后端需要
-# - libpq-dev: PostgreSQL 客户端库
-# - gcc: 编译 psycopg2-binary 需要
+# Runtime deps:
+# - git/libpq/gcc/openssl: existing app needs
+# - curl/ca-certificates/nodejs: passwordless sentinel SO token generation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
     openssl \
+    curl \
+    ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && node --version \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
