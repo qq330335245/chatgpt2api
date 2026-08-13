@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const http = require("http");
+const net = require("net");
+const tls = require("tls");
 const vm = require("vm");
 const crypto = require("crypto");
 const { TextEncoder } = require("util");
@@ -43,6 +46,7 @@ function parseArgs(argv) {
     userRegion: "",
     cookieHeader: "",
     fetchCookieHeader: null,
+    proxy: "",
   };
   for (let i = 2; i < argv.length; i++) {
     const item = argv[i];
@@ -78,8 +82,307 @@ function parseArgs(argv) {
     else if (item === "--user-region") result.userRegion = argv[++i] || result.userRegion;
     else if (item === "--cookie-header") result.cookieHeader = argv[++i] || result.cookieHeader;
     else if (item === "--fetch-cookie-header") result.fetchCookieHeader = argv[++i] || "";
+    else if (item === "--proxy") result.proxy = argv[++i] || result.proxy;
   }
   return result;
+}
+
+function envProxyUrl() {
+  return String(
+    process.env.SENTINEL_PROXY ||
+      process.env.ALL_PROXY ||
+      process.env.all_proxy ||
+      process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      ""
+  ).trim();
+}
+
+function resolveProxyUrl(proxyUrl) {
+  return String(proxyUrl || envProxyUrl() || "").trim();
+}
+
+function createSocketReader(socket) {
+  let buffer = Buffer.alloc(0);
+  let pending = null;
+  let closed = false;
+  const flush = () => {
+    if (!pending || buffer.length < pending.size) return;
+    const { size, resolve } = pending;
+    pending = null;
+    const out = buffer.subarray(0, size);
+    buffer = buffer.subarray(size);
+    resolve(out);
+  };
+  const onData = (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    flush();
+  };
+  const onError = (err) => {
+    if (!pending) return;
+    const { reject } = pending;
+    pending = null;
+    reject(err);
+  };
+  const onClose = () => {
+    closed = true;
+    if (!pending) return;
+    const { reject } = pending;
+    pending = null;
+    reject(new Error("socks5 socket closed"));
+  };
+  socket.on("data", onData);
+  socket.once("error", onError);
+  socket.once("close", onClose);
+  return {
+    read(size) {
+      if (size <= 0) return Promise.resolve(Buffer.alloc(0));
+      if (buffer.length >= size) {
+        const out = buffer.subarray(0, size);
+        buffer = buffer.subarray(size);
+        return Promise.resolve(out);
+      }
+      if (closed) return Promise.reject(new Error("socks5 socket closed"));
+      return new Promise((resolve, reject) => {
+        pending = { size, resolve, reject };
+      });
+    },
+    detach() {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      if (buffer.length) socket.unshift(buffer);
+      buffer = Buffer.alloc(0);
+    },
+  };
+}
+
+async function socks5Connect(proxyUrl, hostname, port) {
+  const parsed = typeof proxyUrl === "string" ? new URL(proxyUrl) : proxyUrl;
+  const proxyHost = parsed.hostname;
+  const proxyPort = Number(parsed.port || 1080);
+  const username = decodeURIComponent(parsed.username || "");
+  const password = decodeURIComponent(parsed.password || "");
+  const socket = await new Promise((resolve, reject) => {
+    const sock = net.connect({ host: proxyHost, port: proxyPort }, () => resolve(sock));
+    sock.once("error", reject);
+  });
+  socket.setNoDelay(true);
+  const reader = createSocketReader(socket);
+  try {
+    socket.write(username ? Buffer.from([0x05, 0x01, 0x02]) : Buffer.from([0x05, 0x01, 0x00]));
+    const methodReply = await reader.read(2);
+    if (methodReply[0] !== 0x05) throw new Error("socks5 invalid version");
+    if (methodReply[1] === 0x02) {
+      const userBuf = Buffer.from(username);
+      const passBuf = Buffer.from(password);
+      const auth = Buffer.alloc(3 + userBuf.length + passBuf.length);
+      auth[0] = 0x01;
+      auth[1] = userBuf.length;
+      userBuf.copy(auth, 2);
+      auth[2 + userBuf.length] = passBuf.length;
+      passBuf.copy(auth, 3 + userBuf.length);
+      socket.write(auth);
+      const authReply = await reader.read(2);
+      if (authReply[1] !== 0x00) throw new Error("socks5 auth failed");
+    } else if (methodReply[1] !== 0x00) {
+      throw new Error(`socks5 unsupported method ${methodReply[1]}`);
+    }
+
+    const destPort = Buffer.from([(port >> 8) & 0xff, port & 0xff]);
+    let dest;
+    if (net.isIP(hostname) === 4) {
+      dest = Buffer.concat([
+        Buffer.from([0x05, 0x01, 0x00, 0x01]),
+        Buffer.from(hostname.split(".").map((part) => Number(part))),
+        destPort,
+      ]);
+    } else {
+      const hostBuf = Buffer.from(hostname);
+      if (hostBuf.length > 255) throw new Error("socks5 hostname too long");
+      dest = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]), hostBuf, destPort]);
+    }
+    socket.write(dest);
+    const head = await reader.read(4);
+    if (head[0] !== 0x05 || head[1] !== 0x00) throw new Error(`socks5 connect failed code=${head[1]}`);
+    let rest = 0;
+    if (head[3] === 0x01) rest = 6;
+    else if (head[3] === 0x04) rest = 18;
+    else if (head[3] === 0x03) rest = (await reader.read(1))[0] + 2;
+    else throw new Error(`socks5 unknown atyp ${head[3]}`);
+    if (rest) await reader.read(rest);
+  } catch (err) {
+    reader.detach();
+    socket.destroy();
+    throw err;
+  }
+  reader.detach();
+  return socket;
+}
+
+function connectHttpProxy(proxyUrl, hostname, port) {
+  const parsed = typeof proxyUrl === "string" ? new URL(proxyUrl) : proxyUrl;
+  return new Promise((resolve, reject) => {
+    const headers = { host: `${hostname}:${port}` };
+    if (parsed.username || parsed.password) {
+      const auth = `${decodeURIComponent(parsed.username || "")}:${decodeURIComponent(parsed.password || "")}`;
+      headers["proxy-authorization"] = `Basic ${Buffer.from(auth).toString("base64")}`;
+    }
+    const req = http.request({
+      host: parsed.hostname,
+      port: Number(parsed.port || 80),
+      method: "CONNECT",
+      path: `${hostname}:${port}`,
+      headers,
+    });
+    req.once("connect", (res, socket, head) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`http proxy connect failed ${res.statusCode}`));
+        return;
+      }
+      if (head && head.length) socket.unshift(head);
+      resolve(socket);
+    });
+    req.once("error", reject);
+    req.end();
+  });
+}
+
+function tlsWrap(socket, hostname) {
+  return new Promise((resolve, reject) => {
+    const tlsSocket = tls.connect({ socket, servername: hostname });
+    tlsSocket.once("secureConnect", () => resolve(tlsSocket));
+    tlsSocket.once("error", reject);
+  });
+}
+
+async function openProxiedSocket(proxyUrl, targetUrl) {
+  const hostname = targetUrl.hostname;
+  const port = Number(targetUrl.port || (targetUrl.protocol === "https:" ? 443 : 80));
+  const parsed = new URL(proxyUrl);
+  const protocol = String(parsed.protocol || "").replace(":", "").toLowerCase();
+  let raw;
+  if (protocol === "http" || protocol === "https") {
+    raw = await connectHttpProxy(parsed, hostname, port);
+  } else if (protocol === "socks" || protocol === "socks5" || protocol === "socks5h") {
+    raw = await socks5Connect(parsed, hostname, port);
+  } else {
+    throw new Error(`unsupported sentinel proxy protocol: ${protocol}`);
+  }
+  if (targetUrl.protocol === "https:") return tlsWrap(raw, hostname);
+  return raw;
+}
+
+function headersToObject(headers) {
+  if (!headers) return {};
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    return Object.fromEntries(headers.entries());
+  }
+  if (typeof headers.forEach === "function") {
+    const out = {};
+    headers.forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  }
+  return { ...headers };
+}
+
+function decodeChunkedBody(buf) {
+  const out = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    const nl = buf.indexOf("\r\n", offset);
+    if (nl < 0) break;
+    const size = parseInt(buf.subarray(offset, nl).toString("ascii"), 16);
+    if (!Number.isFinite(size)) break;
+    if (size === 0) break;
+    const start = nl + 2;
+    out.push(buf.subarray(start, start + size));
+    offset = start + size + 2;
+  }
+  return Buffer.concat(out);
+}
+
+function parseHttpResponse(buf) {
+  const sep = buf.indexOf("\r\n\r\n");
+  if (sep < 0) throw new Error("invalid http response");
+  const head = buf.subarray(0, sep).toString("latin1");
+  let body = buf.subarray(sep + 4);
+  const lines = head.split("\r\n");
+  const match = String(lines[0] || "").match(/^HTTP\/\d+\.\d+\s+(\d+)\s*(.*)$/);
+  if (!match) throw new Error("invalid http status");
+  const headerList = [];
+  let chunked = false;
+  for (const line of lines.slice(1)) {
+    const idx = line.indexOf(":");
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    headerList.push([key, value]);
+    if (key.toLowerCase() === "transfer-encoding" && value.toLowerCase().includes("chunked")) chunked = true;
+  }
+  if (chunked) body = decodeChunkedBody(body);
+  return new Response(body, {
+    status: Number(match[1]),
+    statusText: match[2] || "",
+    headers: headerList,
+  });
+}
+
+function requestOnSocket(socket, targetUrl, init) {
+  const method = String(init.method || "GET").toUpperCase();
+  const headers = { ...headersToObject(init.headers), connection: "close" };
+  const body = init.body == null ? undefined : Buffer.from(String(init.body));
+  if (body && !Object.keys(headers).some((key) => key.toLowerCase() === "content-length")) {
+    headers["content-length"] = String(body.length);
+  }
+  const lines = [`${method} ${targetUrl.pathname}${targetUrl.search} HTTP/1.1`, `host: ${targetUrl.host}`];
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() === "host") continue;
+    lines.push(`${key}: ${value}`);
+  }
+  lines.push("", "");
+  const payload = Buffer.concat([Buffer.from(lines.join("\r\n")), body || Buffer.alloc(0)]);
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const onData = (chunk) => chunks.push(chunk);
+    const onEnd = () => {
+      cleanup();
+      try {
+        resolve(parseHttpResponse(Buffer.concat(chunks)));
+      } catch (err) {
+        reject(err);
+      }
+    };
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    const cleanup = () => {
+      socket.off("data", onData);
+      socket.off("end", onEnd);
+      socket.off("error", onError);
+    };
+    socket.on("data", onData);
+    socket.once("end", onEnd);
+    socket.once("error", onError);
+    socket.write(payload);
+  });
+}
+
+function installProxiedFetch(proxyUrl) {
+  const resolved = resolveProxyUrl(proxyUrl);
+  if (!resolved) return "";
+  globalThis.fetch = async (input, init = {}) => {
+    const targetUrl = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+    const socket = await openProxiedSocket(resolved, targetUrl);
+    return requestOnSocket(socket, targetUrl, init);
+  };
+  return resolved;
 }
 
 function btoaNode(value) {
@@ -549,11 +852,19 @@ async function main() {
   const debug = (...items) => {
     if (args.debug) console.error("[debug]", ...items);
   };
+  const activeProxy = installProxiedFetch(args.proxy);
+  if (activeProxy) debug("using proxy", activeProxy);
   let sdkCode = "";
   if (args.sdkPath && fs.existsSync(args.sdkPath)) {
     sdkCode = fs.readFileSync(args.sdkPath, "utf8");
   } else {
-    const response = await fetch(SDK_URL);
+    const response = await fetch(SDK_URL, {
+      headers: {
+        "user-agent": args.userAgent,
+        accept: "*/*",
+        referer: args.pageUrl || "https://auth.openai.com/email-verification",
+      },
+    });
     if (!response.ok) throw new Error(`failed to fetch Sentinel SDK: ${response.status}`);
     sdkCode = await response.text();
   }

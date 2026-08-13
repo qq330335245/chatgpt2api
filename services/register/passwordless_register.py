@@ -113,6 +113,7 @@ class PasswordlessRegistrar(PlatformRegistrar):
             prefer_node=True if require_real_t else None,
             with_so=with_so,
             require_real_t=require_real_t,
+            proxy=self.proxy,
         )
         token = str(bundle.get("token") or "").strip()
         if not token:

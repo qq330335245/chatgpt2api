@@ -158,6 +158,28 @@ def _page_url_for_flow(flow: str, page_url: str = "") -> str:
     return _FLOW_PAGE_URLS.get(str(flow or "").strip(), "")
 
 
+def _proxy_from_session(session: Any) -> str:
+    if session is None:
+        return ""
+    proxies = getattr(session, "proxies", None)
+    if isinstance(proxies, dict):
+        for key in ("all", "https", "http"):
+            value = str(proxies.get(key) or "").strip()
+            if value:
+                return value
+    value = getattr(session, "proxy", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return ""
+
+
+def _resolve_proxy(proxy: str = "", session: Any = None) -> str:
+    explicit = str(proxy or "").strip()
+    if explicit:
+        return explicit
+    return _proxy_from_session(session)
+
+
 def _oai_sc_from_token_payload(payload: dict[str, Any]) -> str:
     c_value = str(payload.get("c") or "").strip()
     return f"0{c_value}" if c_value else ""
@@ -182,6 +204,7 @@ def build_sentinel_token_via_node(
     page_url: str = "",
     timeout_seconds: int = 70,
     with_so: bool = False,
+    proxy: str = "",
 ) -> tuple[str, str, str, list[str]]:
     """Run Sentinel SDK in Node and return (token, oai_sc, so_token, set_cookies)."""
     script = _node_probe_script()
@@ -206,6 +229,9 @@ def build_sentinel_token_via_node(
         command.extend(["--page-url", resolved_page_url])
     if user_agent:
         command.extend(["--user-agent", user_agent])
+    resolved_proxy = _resolve_proxy(proxy)
+    if resolved_proxy:
+        command.extend(["--proxy", resolved_proxy])
 
     try:
         completed = subprocess.run(
@@ -332,6 +358,7 @@ def build_sentinel_token(
     sec_ch_ua: str = "",
     page_url: str = "",
     prefer_node: bool | None = None,
+    proxy: str = "",
 ) -> tuple[str, str]:
     """?? sentinel token ??? (sentinel_header_value, oai_sc_cookie_value)?
 
@@ -361,6 +388,7 @@ def build_sentinel_token(
                 user_agent=user_agent or DEFAULT_SENTINEL_USER_AGENT,
                 page_url=page_url,
                 with_so=False,
+                proxy=_resolve_proxy(proxy, session),
             )
             return token, oai_sc
         except Exception:
@@ -387,6 +415,7 @@ def build_sentinel_token_bundle(
     prefer_node: bool | None = None,
     with_so: bool = False,
     require_real_t: bool = False,
+    proxy: str = "",
 ) -> dict[str, Any]:
     """Return token bundle for auth requests.
 
@@ -408,6 +437,7 @@ def build_sentinel_token_bundle(
                 user_agent=user_agent or DEFAULT_SENTINEL_USER_AGENT,
                 page_url=page_url,
                 with_so=with_so,
+                proxy=_resolve_proxy(proxy, session),
             )
             if require_real_t:
                 payload = json.loads(token)
