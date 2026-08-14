@@ -62,6 +62,26 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _slim_image_data(data: object) -> list[dict[str, Any]]:
+    """Persist only URL metadata; never keep full b64_json in the task table."""
+    if not isinstance(data, list):
+        return []
+    slim: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        entry: dict[str, Any] = {}
+        url = item.get("url")
+        if isinstance(url, str) and url.strip():
+            entry["url"] = url.strip()
+        revised = item.get("revised_prompt")
+        if isinstance(revised, str) and revised.strip():
+            entry["revised_prompt"] = revised.strip()
+        if entry:
+            slim.append(entry)
+    return slim
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -375,6 +395,8 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 return
+            if "data" in updates:
+                updates = {**updates, "data": _slim_image_data(updates.get("data"))}
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
@@ -418,7 +440,7 @@ class ImageTaskService:
             }
             data = item.get("data")
             if isinstance(data, list):
-                task["data"] = data
+                task["data"] = _slim_image_data(data)
             usage = item.get("usage")
             if isinstance(usage, dict):
                 task["usage"] = usage
@@ -527,20 +549,16 @@ class ImageTaskService:
             if not image_urls:
                 raise RuntimeError("图片 URL 解析失败")
 
-            image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                for image_data in backend.download_image_bytes(image_urls)
-            ]
+            image_items = [{"image_bytes": image_data} for image_data in backend.download_image_bytes(image_urls)]
             # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
             with self._lock:
                 task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
+                base_url = _clean((task or {}).get("base_url"))
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
+                "url",
+                base_url or None,
                 int(time.time()),
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))

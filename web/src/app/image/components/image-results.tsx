@@ -481,9 +481,10 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-const base64SizeCache = new Map<string, string>();
+const base64SizeCache = new Map<number, string>();
 function formatBase64ImageSize(base64: string) {
-  let cached = base64SizeCache.get(base64);
+  const normalizedLength = base64.replace(/\s/g, "").length;
+  let cached = base64SizeCache.get(normalizedLength);
   if (cached !== undefined) return cached;
   const normalized = base64.replace(/\s/g, "");
   const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
@@ -496,7 +497,8 @@ function formatBase64ImageSize(base64: string) {
   } else {
     cached = `${bytes} B`;
   }
-  base64SizeCache.set(base64, cached);
+  // Key by length, never by the full base64 payload.
+  base64SizeCache.set(normalizedLength, cached);
   return cached;
 }
 

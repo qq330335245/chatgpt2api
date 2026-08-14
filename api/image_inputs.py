@@ -71,7 +71,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "n": _parse_count(fields.get("n")),
         "size": _clean(fields.get("size")) or None,
         "quality": _clean(fields.get("quality"), "auto"),
-        "response_format": _clean(fields.get("response_format"), "b64_json"),
+        "response_format": _clean(fields.get("response_format"), "url"),
         "stream": _parse_bool(fields.get("stream")),
     }
     if "client_task_id" in fields:

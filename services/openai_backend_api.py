@@ -901,9 +901,9 @@ class OpenAIBackendAPI:
             candidate_path = Path(os.path.expanduser(image))
             if candidate_path.exists() and candidate_path.is_file():
                 file_name = candidate_path.name
-        image = Image.open(BytesIO(data))
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, "image/png")
+        with Image.open(BytesIO(data)) as image:
+            width, height = image.size
+            mime_type = Image.MIME.get(image.format, "image/png")
         path = "/backend-api/files"
         response = self.session.post(
             self.base_url + path,
@@ -1303,10 +1303,10 @@ class OpenAIBackendAPI:
             mime_type = str(match.group(1) or "").strip().lower()
             payload = str(match.group(2) or "").strip()
         data = base64.b64decode(payload)
-        image = Image.open(BytesIO(data))
-        image.load()
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, mime_type or "image/png")
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            width, height = image.size
+            mime_type = Image.MIME.get(image.format, mime_type or "image/png")
         extension = mimetypes.guess_extension(mime_type) or ".png"
         return data, f"image_{index}{extension}", mime_type, width, height
 
@@ -2522,12 +2522,23 @@ class OpenAIBackendAPI:
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
-        images = []
+        images: list[bytes] = []
+        seen: set[bytes] = set()
         for url in urls:
             response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            try:
+                ensure_ok(response, "image_download")
+                content = response.content
+            finally:
+                # Drop curl_cffi/http body buffers as soon as bytes are copied out.
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            if content in seen:
+                continue
+            seen.add(content)
+            images.append(content)
         return images
 
     def stream_conversation(

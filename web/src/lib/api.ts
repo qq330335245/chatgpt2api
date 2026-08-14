@@ -492,7 +492,7 @@ export async function generateImage(prompt: string, model?: ImageModel, size?: s
         ...(size ? { size } : {}),
         quality,
         n: 1,
-        response_format: "b64_json",
+        response_format: "url",
       },
     },
   );
@@ -514,6 +514,7 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
   }
   formData.append("quality", quality);
   formData.append("n", "1");
+  formData.append("response_format", "url");
 
   return httpRequest<ImageResponse>(
     "/v1/images/edits",

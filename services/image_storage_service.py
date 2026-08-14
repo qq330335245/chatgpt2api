@@ -59,6 +59,14 @@ def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
         return None
 
 
+def _image_dimensions_from_path(path: Path) -> tuple[int, int] | None:
+    try:
+        with Image.open(path) as image:
+            return image.size
+    except Exception:
+        return None
+
+
 def _is_image_rel(path: str) -> bool:
     try:
         safe_rel = _safe_relative_path(path)
@@ -281,7 +289,7 @@ class ImageStorageService:
                     continue
                 dimensions = None
                 try:
-                    dimensions = _image_dimensions(path.read_bytes())
+                    dimensions = _image_dimensions_from_path(path)
                 except Exception:
                     dimensions = None
                 indexed[rel] = {

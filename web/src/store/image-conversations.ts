@@ -71,23 +71,33 @@ const IMAGE_CONVERSATIONS_KEY = "items";
 let imageConversationWriteQueue: Promise<void> = Promise.resolve();
 
 function normalizeStoredImage(image: StoredImage): StoredImage {
-  const normalized = {
-    ...image,
+  const url = typeof image.url === "string" && image.url ? image.url : undefined;
+  // Prefer URL persistence; drop large base64 once a durable URL exists.
+  const b64_json = url
+    ? undefined
+    : typeof image.b64_json === "string" && image.b64_json
+      ? image.b64_json
+      : undefined;
+  const normalized: StoredImage = {
+    id: image.id,
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
-    url: typeof image.url === "string" && image.url ? image.url : undefined,
+    progress: image.progress,
+    b64_json,
+    url,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
+    error: image.error,
     startTime: typeof image.startTime === "number" ? image.startTime : undefined,
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
     elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
     durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success") {
-    return normalized;
+    return { ...normalized, status: image.status };
   }
   return {
     ...normalized,
-    status: image.b64_json || image.url ? "success" : "loading",
+    status: b64_json || url ? "success" : "loading",
   };
 }
 

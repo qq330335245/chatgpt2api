@@ -463,6 +463,11 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
     for index, item in enumerate(image_items, start=1):
         if not isinstance(item, dict):
             continue
+        url = str(item.get("url") or "").strip()
+        if url:
+            markdown_images.append(f"![image_{index}]({url})")
+            continue
+        # Fallback for callers that still only have base64 payloads.
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
             markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")

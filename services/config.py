@@ -44,8 +44,13 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
     "ttl_seconds": 60,
     "max_entries": 256,
+    # Cap a single cached payload and the whole cache so image/long replies
+    # cannot pin hundreds of MB just by entry count.
+    "max_entry_bytes": 4 * 1024 * 1024,
+    "max_total_bytes": 32 * 1024 * 1024,
     "dedupe_inflight": True,
-    "stream_cache": True,
+    # Streaming cache keeps every chunk in RAM; off by default on small hosts.
+    "stream_cache": False,
     "normalize_messages": True,
     "drop_adjacent_duplicates": True,
     "drop_assistant_history": False,
@@ -177,6 +182,16 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
             source.get("max_entries"),
             int(DEFAULT_CHAT_COMPLETION_CACHE["max_entries"]),
             1,
+        ),
+        "max_entry_bytes": _normalize_positive_int(
+            source.get("max_entry_bytes"),
+            int(DEFAULT_CHAT_COMPLETION_CACHE["max_entry_bytes"]),
+            0,
+        ),
+        "max_total_bytes": _normalize_positive_int(
+            source.get("max_total_bytes"),
+            int(DEFAULT_CHAT_COMPLETION_CACHE["max_total_bytes"]),
+            0,
         ),
         "dedupe_inflight": _normalize_bool(
             source.get("dedupe_inflight"),

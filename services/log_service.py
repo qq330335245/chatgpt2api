@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -71,13 +72,44 @@ class LogService:
         with self.path.open("a", encoding="utf-8") as file:
             file.write(self._serialize_item(item) + "\n")
 
+    def _iter_raw_lines_reverse(self) -> Iterator[str]:
+        """Yield log lines from newest to oldest without loading the whole file as one string."""
+        if not self.path.exists():
+            return
+        with self.path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            position = file.tell()
+            if position <= 0:
+                return
+            buffer = b""
+            chunk_size = 64 * 1024
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                file.seek(position)
+                chunk = file.read(read_size)
+                data = chunk + buffer
+                parts = data.split(b"\n")
+                buffer = parts[0]
+                for part in reversed(parts[1:]):
+                    if not part:
+                        continue
+                    yield part.decode("utf-8", errors="ignore")
+            if buffer:
+                yield buffer.decode("utf-8", errors="ignore")
+
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
+        # line_number only affects legacy id derivation for rows without id.
+        line_number = 10 ** 12
+        for raw_line in self._iter_raw_lines_reverse():
+            text = raw_line.strip()
+            if not text:
+                continue
+            line_number -= 1
+            item = self._parse_line(text, line_number)
             if item is None:
                 continue
             if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
@@ -91,22 +123,22 @@ class LogService:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
         removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with self.path.open("r", encoding="utf-8") as src, tmp_path.open("w", encoding="utf-8") as dst:
+            for line_number, raw_line in enumerate(src):
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                item = self._parse_line(stripped, line_number)
+                if item is None:
+                    dst.write(stripped + "\n")
+                    continue
+                if str(item.get("id") or "") in target_ids:
+                    removed += 1
+                    continue
+                dst.write(self._serialize_item(item) + "\n")
+        tmp_path.replace(self.path)
         return {"removed": removed}
 
 

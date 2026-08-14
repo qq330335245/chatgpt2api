@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -223,6 +224,7 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
+@lru_cache(maxsize=32)
 def encoding_for_model(model: str):
     try:
         return tiktoken.encoding_for_model(model)
@@ -270,27 +272,53 @@ def format_image_result(
     created: int | None = None,
     message: str = "",
 ) -> dict[str, Any]:
+    """Materialize image items once: bytes/url first, base64 only when requested."""
     data: list[dict[str, Any]] = []
+    want_b64 = str(response_format or "").strip().lower() == "b64_json"
     for item in items:
-        b64_json = str(item.get("b64_json") or "").strip()
-        if not b64_json:
+        if not isinstance(item, dict):
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        if response_format == "b64_json":
-            data.append({
-                "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
-        else:
-            data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+        existing_url = str(item.get("url") or "").strip()
+        b64_json = str(item.get("b64_json") or "").strip()
+        image_bytes = item.get("image_bytes")
+        if not isinstance(image_bytes, (bytes, bytearray)):
+            image_bytes = None
+        elif isinstance(image_bytes, bytearray):
+            image_bytes = bytes(image_bytes)
+
+        if image_bytes is None and b64_json:
+            try:
+                image_bytes = base64.b64decode(b64_json, validate=False)
+            except Exception:
+                image_bytes = None
+
+        url = existing_url
+        if not url and image_bytes is not None:
+            url = save_image_bytes(image_bytes, base_url)
+        if not url and not (want_b64 and b64_json):
+            continue
+
+        entry: dict[str, Any] = {"revised_prompt": revised_prompt}
+        if url:
+            entry["url"] = url
+        if want_b64:
+            if not b64_json and image_bytes is not None:
+                b64_json = base64.b64encode(image_bytes).decode("ascii")
+            if b64_json:
+                entry["b64_json"] = b64_json
+            elif not url:
+                continue
+        data.append(entry)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
     return result
+
+
+def _image_items_from_urls(backend: OpenAIBackendAPI, image_urls: list[str]) -> list[dict[str, Any]]:
+    """Download each image once and keep raw bytes for a single format pass."""
+    return [{"image_bytes": image_data} for image_data in backend.download_image_bytes(image_urls)]
 
 
 @dataclass
@@ -303,7 +331,7 @@ class ConversationRequest:
     n: int = 1
     size: str | None = None
     quality: str = "auto"
-    response_format: str = "b64_json"
+    response_format: str = "url"
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
@@ -689,8 +717,19 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         if token:
             attempted_tokens.add(token)
         active_backend = None
+        owns_backend = False
         try:
-            active_backend = OpenAIBackendAPI(access_token=token)
+            # Reuse the caller's session when the token still matches; only open a
+            # replacement Session after refresh/failover.
+            if (
+                token
+                and token == getattr(backend, "access_token", "")
+                and not getattr(backend, "_closed", False)
+            ):
+                active_backend = backend
+            else:
+                active_backend = OpenAIBackendAPI(access_token=token)
+                owns_backend = True
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
@@ -719,7 +758,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     continue
             raise
         finally:
-            if active_backend is not None:
+            if owns_backend and active_backend is not None:
                 active_backend.close()
 
 
@@ -958,10 +997,7 @@ def stream_image_outputs(
     if image_urls:
         if request.progress_callback:
             request.progress_callback("receiving_image")
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
+        image_items = _image_items_from_urls(backend, image_urls)
         data = format_image_result(
             image_items,
             request.prompt,
@@ -1056,10 +1092,7 @@ def stream_image_outputs(
                 if image_urls:
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
-                    image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                        for image_data in backend.download_image_bytes(image_urls)
-                    ]
+                    image_items = _image_items_from_urls(backend, image_urls)
                     data = format_image_result(
                         image_items,
                         request.prompt,
@@ -1169,10 +1202,7 @@ def stream_image_outputs(
             if image_urls:
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
-                image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
+                image_items = _image_items_from_urls(backend, image_urls)
                 data = format_image_result(
                     image_items,
                     request.prompt,
@@ -1511,7 +1541,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
+    # Bound workers so n large does not spawn one Session/stack per image unbounded.
+    max_workers = max(1, min(int(request.n or 1), 5))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for index in range(1, request.n + 1):
             future = executor.submit(_generate_single_image, request, index, request.n)
             futures[future] = index
