@@ -1,0 +1,46 @@
+name: Build web_dist
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - web/**
+      - VERSION
+      - CHANGELOG.md
+      - .github/workflows/web-dist.yml
+
+permissions:
+  contents: read
+
+jobs:
+  web-dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build static export
+        working-directory: web
+        env:
+          NEXT_PUBLIC_APP_VERSION: ${{ github.sha }}
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          test -f out/index.html
+
+      - name: Pack web_dist.zip
+        run: |
+          rm -rf web_dist
+          mkdir web_dist
+          cp -a web/out/. web_dist/
+          zip -r web_dist.zip web_dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web_dist
+          path: web_dist.zip
+          if-no-files-found: error
