@@ -14,6 +14,8 @@ from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
 
+from urllib.parse import quote
+
 from curl_cffi import requests
 
 
@@ -1276,12 +1278,17 @@ class InbucketMailProvider(BaseMailProvider):
             self.domain = [str(item).strip() for item in raw_domains if str(item).strip()]
         else:
             self.domain = [str(raw_domains).strip()] if str(raw_domains).strip() else []
-        self.random_subdomain = bool(entry.get("random_subdomain", True))
+        self.random_subdomain = bool(entry.get("random_subdomain", False))
+        self.mailbox_naming = str(entry.get("mailbox_naming") or "full").strip().lower() or "full"
         self.session = _create_session(conf)
-        self.session.headers.update({
+        headers = {
             "User-Agent": conf["user_agent"],
             "Accept": "application/json",
-        })
+        }
+        token = str(entry.get("api_token") or entry.get("token") or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        self.session.headers.update(headers)
 
     def _request(self, method: str, path: str, expected: tuple[int, ...] = (200,)):
         resp = self.session.request(
@@ -1305,8 +1312,14 @@ class InbucketMailProvider(BaseMailProvider):
         raise RuntimeError("Inbucket 需要至少配置一个 domain")
 
     def _mailbox_name(self, address: str) -> str:
-        local_part, _, _ = str(address or "").partition("@")
+        addr = str(address or "").strip().lower()
+        if self.mailbox_naming != "local":
+            return addr
+        local_part, _, _ = addr.partition("@")
         return local_part.strip()
+
+    def _mailbox_path(self, address: str) -> str:
+        return quote(self._mailbox_name(address), safe="")
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         local_part = username or _random_mailbox_name()
@@ -1326,7 +1339,7 @@ class InbucketMailProvider(BaseMailProvider):
         mailbox_name = str(mailbox.get("mailbox_name") or self._mailbox_name(str(mailbox.get("address") or ""))).strip()
         if not mailbox_name:
             raise RuntimeError("Inbucket 缺少 mailbox_name")
-        data = self._request("GET", f"/api/v1/mailbox/{mailbox_name}")
+        data = self._request("GET", f"/api/v1/mailbox/{quote(mailbox_name, safe='')}")
         items = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
         if not items:
             return None
@@ -1342,7 +1355,7 @@ class InbucketMailProvider(BaseMailProvider):
             message_id = str(item.get("id") or "").strip()
             if not message_id:
                 continue
-            detail = self._request("GET", f"/api/v1/mailbox/{mailbox_name}/{message_id}")
+            detail = self._request("GET", f"/api/v1/mailbox/{quote(mailbox_name, safe='')}/{quote(message_id, safe='')}")
             if not isinstance(detail, dict):
                 continue
             header = detail.get("header") if isinstance(detail.get("header"), dict) else {}

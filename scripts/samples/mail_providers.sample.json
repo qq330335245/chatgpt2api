@@ -1,9 +1,22 @@
 {
   "providers": [
     {
+      "provider_ref": "inbucket1",
+      "type": "inbucket",
+      "enable": true,
+      "label": "Oracle Inbucket",
+      "api_base": "https://mailin.konsin.de5.net",
+      "api_token": "YOUR_INGEST_TOKEN",
+      "mailbox_naming": "full",
+      "random_subdomain": false,
+      "domain": [
+        "konsin.de5.net"
+      ]
+    },
+    {
       "provider_ref": "cf1",
       "type": "cloudflare_temp_email",
-      "enable": true,
+      "enable": false,
       "label": "CF Temp Mail",
       "api_base": "https://your-worker.example.com",
       "admin_password": "YOUR_ADMIN_PASSWORD",
