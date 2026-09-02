@@ -1333,12 +1333,54 @@ class InbucketMailProvider(BaseMailProvider):
             "address": address,
             "base_domain": base_domain,
             "mailbox_name": mailbox_name,
+            "inbox_address": address,
+            "filter_email": address,
+            "auth_mode": "admin",
+            "token": "inbucket",
         }
 
+    def get_existing_mailbox(self, email: str, receive_email: str = "") -> dict[str, Any]:
+        """iCloud HME 等代收：inbox 是 Inbucket 邮箱，email 是登录别名。"""
+        alias = str(email or "").strip().lower()
+        inbox = str(receive_email or "").strip().lower() or alias
+        if not inbox:
+            raise RuntimeError("Inbucket 邮箱地址不能为空")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": alias or inbox,
+            "filter_email": alias or inbox,
+            "inbox_address": inbox,
+            "mailbox_name": self._mailbox_name(inbox),
+            "auth_mode": "admin",
+            "token": "forward",
+        }
+
+    @staticmethod
+    def _flatten_raw(detail: dict[str, Any], header: dict[str, Any], body: dict[str, Any]) -> str:
+        source = detail.get("source")
+        if isinstance(source, str) and source.strip():
+            return source
+        parts: list[str] = []
+        for key, value in header.items():
+            if isinstance(value, list):
+                value = ", ".join(str(item) for item in value)
+            parts.append(f"{key}: {value}")
+        text = str(body.get("text") or "")
+        html = str(body.get("html") or "")
+        return "\n".join(parts) + "\n\n" + text + "\n" + html
+
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
-        mailbox_name = str(mailbox.get("mailbox_name") or self._mailbox_name(str(mailbox.get("address") or ""))).strip()
+        inbox = str(
+            mailbox.get("inbox_address")
+            or mailbox.get("mailbox_name")
+            or mailbox.get("address")
+            or ""
+        ).strip()
+        mailbox_name = str(mailbox.get("mailbox_name") or self._mailbox_name(inbox)).strip()
         if not mailbox_name:
             raise RuntimeError("Inbucket 缺少 mailbox_name")
+        filter_email = str(mailbox.get("filter_email") or mailbox.get("address") or "").strip()
         data = self._request("GET", f"/api/v1/mailbox/{quote(mailbox_name, safe='')}")
         items = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
         if not items:
@@ -1350,7 +1392,6 @@ class InbucketMailProvider(BaseMailProvider):
             ),
             reverse=True,
         )
-        address = str(mailbox.get("address") or "").strip()
         for item in items:
             message_id = str(item.get("id") or "").strip()
             if not message_id:
@@ -1360,19 +1401,20 @@ class InbucketMailProvider(BaseMailProvider):
                 continue
             header = detail.get("header") if isinstance(detail.get("header"), dict) else {}
             body = detail.get("body") if isinstance(detail.get("body"), dict) else {}
+            raw = self._flatten_raw(detail, header, body if isinstance(body, dict) else {})
             normalized = {
                 "provider": self.name,
                 "mailbox": mailbox_name,
                 "message_id": message_id,
                 "subject": str(detail.get("subject") or item.get("subject") or ""),
                 "sender": str(detail.get("from") or item.get("from") or ""),
-                "text_content": str(body.get("text") or ""),
-                "html_content": str(body.get("html") or ""),
+                "text_content": str((body or {}).get("text") or ""),
+                "html_content": str((body or {}).get("html") or ""),
                 "received_at": _parse_received_at(detail.get("date") or item.get("date")),
                 "to": header.get("To") if isinstance(header, dict) else None,
-                "raw": detail,
+                "raw": raw,
             }
-            if _message_matches_email(normalized, address):
+            if _message_matches_email(normalized, filter_email):
                 return normalized
         return None
 

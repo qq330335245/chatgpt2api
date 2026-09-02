@@ -64,8 +64,8 @@ export function RegisterCard() {
       ...(type === "icloud" ? {
         connection_mode: "temp_mail",
         icloud_cookies: "",
-        temp_mail_type: "cloudflare_temp_email",
-        temp_mail_provider_ref: "",
+        temp_mail_type: "inbucket",
+        temp_mail_provider_ref: "inbucket1",
         temp_mail_target_email: "",
         shared_email: "",
         shared_password: "",
@@ -438,16 +438,24 @@ export function RegisterCard() {
                           {String(provider.connection_mode || "temp_mail") !== "imap" ? (
                             <>
                               <div className="space-y-2">
-                                <label className="text-sm text-stone-700">HME 转发目标（CF 收件箱）</label>
-                                <Input value={String(provider.temp_mail_target_email || "")} onChange={(event) => updateProvider(index, { temp_mail_target_email: event.target.value })} placeholder="apple@your-domain.com" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                                <label className="text-sm text-stone-700">HME 转发目标（实际收件箱）</label>
+                                <Input value={String(provider.temp_mail_target_email || "")} onChange={(event) => updateProvider(index, { temp_mail_target_email: event.target.value })} placeholder="apple2@konsin.de5.net" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                               </div>
                               <div className="space-y-2">
                                 <label className="text-sm text-stone-700">转发邮服类型</label>
-                                <Input value={String(provider.temp_mail_type || "cloudflare_temp_email")} onChange={(event) => updateProvider(index, { temp_mail_type: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                                <Select value={String(provider.temp_mail_type || "inbucket")} onValueChange={(value) => updateProvider(index, { temp_mail_type: value })} disabled={config.enabled}>
+                                  <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="inbucket">inbucket</SelectItem>
+                                    <SelectItem value="cloudflare_temp_email">cloudflare_temp_email</SelectItem>
+                                  </SelectContent>
+                                </Select>
                               </div>
                               <div className="space-y-2">
-                                <label className="text-sm text-stone-700">转发邮服 provider_ref（可选）</label>
-                                <Input value={String(provider.temp_mail_provider_ref || "")} onChange={(event) => updateProvider(index, { temp_mail_provider_ref: event.target.value })} placeholder="cf1 或 cloudflare_temp_email#1" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                                <label className="text-sm text-stone-700">转发邮服 provider_ref</label>
+                                <Input value={String(provider.temp_mail_provider_ref || "")} onChange={(event) => updateProvider(index, { temp_mail_provider_ref: event.target.value })} placeholder="inbucket1" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                               </div>
                             </>
                           ) : (
@@ -509,7 +517,7 @@ export function RegisterCard() {
                             </label>
                           </div>
                           <div className="rounded-xl border border-sky-100 bg-sky-50/70 px-3 py-2 text-xs leading-5 text-sky-900">
-                            注册时租借/创建 Hide My Email 别名；OTP 按 X-ICLOUD-HME 匹配。请同时配置并启用 cloudflare_temp_email 作为转发收信。
+                            注册时租借/创建 Hide My Email 别名；OTP 按 X-ICLOUD-HME 匹配。请同时配置 inbucket（可关闭「启用」，只给 iCloud 当转发收信）。
                           </div>
                         </>
                       ) : null}
