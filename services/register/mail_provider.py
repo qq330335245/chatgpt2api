@@ -394,12 +394,16 @@ def _extract_code(message: dict[str, Any]) -> str | None:
         if hit:
             return hit
     match = re.search(
-        r"(?:Verification code|login code|code is|临时验证码|登录代码|代码为|验证码)[:\s]*(\d{6})",
+        r"(?:Verification code|login code|code is|临时验证码|登录代码|代码为|验证码)[^0-9]{0,30}(\d{6})",
         content,
         re.I,
     )
     if match:
         hit = _ok(match.group(1))
+        if hit:
+            return hit
+    for line in str(message.get("text_content") or "").splitlines():
+        hit = _ok(line.strip())
         if hit:
             return hit
     for code in re.findall(r">\s*(\d{6})\s*<|(?<![#&])\b(\d{6})\b", content):
@@ -1392,6 +1396,12 @@ class InbucketMailProvider(BaseMailProvider):
             ),
             reverse=True,
         )
+        if filter_email:
+            needle = filter_email.lower()
+            filtered = [item for item in items if needle in json.dumps(item, ensure_ascii=False).lower()]
+            items = filtered or items[:8]
+        else:
+            items = items[:8]
         for item in items:
             message_id = str(item.get("id") or "").strip()
             if not message_id:

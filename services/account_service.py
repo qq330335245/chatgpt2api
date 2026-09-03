@@ -646,7 +646,8 @@ class AccountService:
         email = str(account.get("email") or "").strip()
         if not email:
             return False
-        if self._recent_relogin_attempt(account):
+        # 手动重登不吃 30 分钟退避，否则页面点刷新会静默跳过
+        if not str(event or "").startswith("manual") and self._recent_relogin_attempt(account):
             self._relogin_trace(
                 "fallback_skipped_backoff",
                 email=email,
@@ -656,6 +657,8 @@ class AccountService:
             return False
 
         password = str(account.get("password") or "").strip()
+        if str(account.get("register_flow") or "").strip().lower() == "passwordless":
+            password = ""
         job = {
             "access_token": active_token,
             "email": email,
@@ -1209,12 +1212,15 @@ class AccountService:
         elif str(flag or "").strip().lower() in {"0", "false", "no", "off"}:
             use_register_proxy = False
 
-        proxy = register_proxy if use_register_proxy else ""
-        if not proxy:
-            try:
-                proxy = str(config.get_proxy_settings() or "").strip()
-            except Exception:
-                proxy = ""
+        if use_register_proxy:
+            proxy = register_proxy
+            if not proxy:
+                try:
+                    proxy = str(config.get_proxy_settings() or "").strip()
+                except Exception:
+                    proxy = ""
+        else:
+            proxy = ""
         mail["proxy"] = proxy
         mail["api_use_register_proxy"] = use_register_proxy
         return mail
@@ -1264,9 +1270,49 @@ class AccountService:
         auth_base = "https://auth.openai.com"
         otp_headers = dict(headers or {})
         otp_headers["referer"] = f"{auth_base}/email-verification"
+        otp_headers["origin"] = auth_base
         otp_headers["oai-device-id"] = device_id
         otp_headers["content-type"] = "application/json"
         otp_headers["accept"] = "application/json"
+        otp_headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+        otp_headers.setdefault("x-openai-document-navigation-id", str(uuid.uuid4()))
+        try:
+            session.get(
+                f"{auth_base}/email-verification",
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "user-agent": str(otp_headers.get("user-agent") or self._OAUTH_USER_AGENT),
+                    "referer": "https://chatgpt.com/",
+                },
+                allow_redirects=True,
+                timeout=20,
+            )
+        except Exception:
+            pass
+        try:
+            from utils.sentinel import build_sentinel_token_bundle
+
+            bundle = build_sentinel_token_bundle(
+                session,
+                device_id,
+                "email_otp_validate",
+                page_url=f"{auth_base}/email-verification",
+                prefer_node=True,
+                with_so=True,
+                require_real_t=True,
+            )
+            token = str(bundle.get("token") or "").strip()
+            if token:
+                otp_headers["openai-sentinel-token"] = token
+            so_token = str(bundle.get("so_token") or "").strip()
+            if so_token:
+                otp_headers["openai-sentinel-so-token"] = so_token
+            oai_sc = str(bundle.get("oai_sc") or "").strip()
+            if oai_sc:
+                session.cookies.set("oai-sc", oai_sc, domain=".openai.com")
+                session.cookies.set("oai-sc", oai_sc, domain=".auth.openai.com")
+        except Exception as exc:
+            self._relogin_trace("otp_validate_sentinel_fail", error=str(exc)[:200])
 
         def _do_validate(current_headers: dict):
             resp = session.post(
@@ -1291,12 +1337,14 @@ class AccountService:
             continue_url=str((data or {}).get("continue_url") or "") if isinstance(data, dict) else "",
             page=(data.get("page") if isinstance(data, dict) else None),
             body_preview=data if isinstance(data, dict) else {},
+            has_sentinel=bool(otp_headers.get("openai-sentinel-token")),
+            has_so=bool(otp_headers.get("openai-sentinel-so-token")),
         )
         if getattr(resp, "status_code", None) != 200:
             try:
                 from utils.sentinel import build_sentinel_token
 
-                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "authorize_continue")
+                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "email_otp_validate", page_url=f"{auth_base}/email-verification")
                 otp_headers["openai-sentinel-token"] = sentinel_val
                 if oai_sc_val:
                     session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
@@ -1418,6 +1466,38 @@ class AccountService:
                 provider_ref=str(mail_provider_ref or "").strip(),
                 provider_type=str(mail_provider_type or "").strip(),
             )
+            # iCloud HME 代收：验证码在 Inbucket/CF 箱，wait 直接打转发箱，避免套一层把信滤掉
+            if str(mailbox.get("icloud_mode") or mailbox.get("provider") or "") in {"icloud", "temp_mail", "cf", "forward", "hme"}:
+                inbox = str(mailbox.get("inbox_address") or receive_email or "").strip()
+                alias = str(mailbox.get("filter_email") or mailbox.get("address") or email).strip()
+                nested_ref = ""
+                nested_type = "inbucket"
+                for item in providers:
+                    if not isinstance(item, dict):
+                        continue
+                    ptype = str(item.get("type") or "")
+                    if ptype == "inbucket":
+                        nested_ref = str(item.get("provider_ref") or "")
+                        nested_type = "inbucket"
+                        break
+                    if ptype == "cloudflare_temp_email" and not nested_ref:
+                        nested_ref = str(item.get("provider_ref") or "")
+                        nested_type = ptype
+                if inbox:
+                    try:
+                        nested = mail_provider.get_existing_mailbox(
+                            mail_config,
+                            alias,
+                            receive_email=inbox,
+                            provider_ref=nested_ref,
+                            provider_type=nested_type,
+                        )
+                        if isinstance(nested, dict):
+                            nested["filter_email"] = alias
+                            nested["address"] = alias
+                            mailbox = nested
+                    except Exception:
+                        pass
             self._relogin_trace(
                 "otp_mailbox_ready",
                 email=email,
@@ -1442,11 +1522,26 @@ class AccountService:
                 },
             }
 
+        # login_hint 的信可能比落地时间早几秒
+        window_start = datetime.now(timezone.utc) - timedelta(seconds=90)
         if send_otp:
-            self._send_login_email_otp(session, device_id, headers)
-            self._relogin_trace("otp_send_email_otp", email=email, path="email-otp/send")
-        # 发码后再开窗；只略向前，避免共享代收箱旧码误用
-        mailbox["_code_not_before"] = datetime.now(timezone.utc) - timedelta(seconds=15)
+            send_ok, send_detail = self._send_passwordless_login_otp(session, device_id, headers)
+            self._relogin_trace("otp_send_email_otp", email=email, ok=send_ok, detail=str(send_detail or "")[:180])
+            window_start = datetime.now(timezone.utc) - timedelta(seconds=15)
+        mailbox["_code_not_before"] = window_start
+        try:
+            session.get(
+                "https://auth.openai.com/email-verification",
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "user-agent": str(headers.get("user-agent") or self._OAUTH_USER_AGENT),
+                    "referer": "https://chatgpt.com/",
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
 
         tried: set[str] = set()
         deadline = time.time() + float(mail_config.get("wait_timeout") or 90)
@@ -1532,6 +1627,13 @@ class AccountService:
                 return {
                     "ok": False,
                     "error": "otp_max_check_attempts",
+                    "detail": {"email": email, "tried": sorted(tried), "last": last_detail},
+                }
+            # 同一封信的码已经试过且 OpenAI 拒绝，继续空等只会 otp_timeout
+            if str(result.get("error") or "") == "otp_validate_failed":
+                return {
+                    "ok": False,
+                    "error": "otp_validate_failed",
                     "detail": {"email": email, "tried": sorted(tried), "last": last_detail},
                 }
             # 错误验证码：继续等待下一封邮件
@@ -2197,23 +2299,44 @@ class AccountService:
                 "oai-device-id": device_id,
             }
 
-            continue_result = self._authorize_continue_with_email(
-                session,
-                device_id,
-                email,
-                login_headers,
-                referer=login_headers["referer"],
-                screen_hint="login_or_signup",
+            boot_blob = f"{boot.get('page_type') or ''} {final_url}".lower()
+            already_on_otp = (
+                "email-verification" in boot_blob
+                or "email-otp" in boot_blob
+                or "email_otp" in boot_blob
+                or str(boot.get("page_type") or "").lower() in {"email_otp_verification", "email_otp", "email_verification"}
             )
-            continue_detail = continue_result.get("detail") if isinstance(continue_result.get("detail"), dict) else {}
-            if not continue_result.get("ok"):
-                # login_hint 有时已足够进入登录态，continue 失败不立刻中断
+            continue_detail: dict[str, Any] = {}
+            if already_on_otp:
+                # 入口已停在验证码页时再打 authorize/continue 会把 state 作废，OpenAI 返回 invalid_state
                 self._relogin_trace(
-                    "email_otp_continue_soft_fail",
+                    "email_otp_skip_continue_already_verification",
                     email=email,
-                    error=str(continue_result.get("error") or ""),
-                    detail=continue_detail,
+                    final_url=final_url,
+                    page_type=str(boot.get("page_type") or ""),
                 )
+                continue_detail = {
+                    "page": {"type": "email_otp_verification"},
+                    "continue_url": final_url,
+                }
+            else:
+                continue_result = self._authorize_continue_with_email(
+                    session,
+                    device_id,
+                    email,
+                    login_headers,
+                    referer=login_headers["referer"],
+                    screen_hint="login_or_signup",
+                )
+                continue_detail = continue_result.get("detail") if isinstance(continue_result.get("detail"), dict) else {}
+                if not continue_result.get("ok"):
+                    # login_hint 有时已足够进入登录态，continue 失败不立刻中断
+                    self._relogin_trace(
+                        "email_otp_continue_soft_fail",
+                        email=email,
+                        error=str(continue_result.get("error") or ""),
+                        detail=continue_detail,
+                    )
 
             step = self._classify_login_step(
                 detail=continue_detail,
@@ -2297,7 +2420,7 @@ class AccountService:
                         email=email,
                         continue_url=step.get("continue_url") or final_url,
                     )
-                    # authorize 已落到验证码页时，OpenAI 通常已自动发码；先收码，失败后再补发
+                    # 码已在 authorize/login_hint 发出；再 send 往往不会有新信。下面用短回看窗口收下这封。
                     send_otp = False
                 else:
                     self._relogin_trace(
@@ -3561,6 +3684,9 @@ class AccountService:
 
             email = str(account.get("email") or "").strip()
             password = str(account.get("password") or "").strip()
+            # passwordless 写入的是占位密码，拿去登 OpenAI 只会浪费一次 OTP 等待
+            if str(account.get("register_flow") or "").strip().lower() == "passwordless":
+                password = ""
             if not email:
                 skipped += 1
                 if progress_id:
