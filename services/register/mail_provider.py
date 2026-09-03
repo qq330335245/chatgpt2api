@@ -2513,16 +2513,24 @@ def get_existing_mailbox(
             if not candidates:
                 raise RuntimeError(f"账号绑定的邮箱服务不存在: {ref}")
     else:
-        # 未绑 ref：显式 type 优先；否则默认 Cloudflare Temp Mail，免逐账号配置
+        # 未绑 ref：显式 type 优先；已启用的 icloud/inbucket 优先于历史 CF 默认
         if not ptype:
-            ptype = DEFAULT_EXISTING_MAILBOX_PROVIDER_TYPE
+            enabled_types = [str(item.get("type") or "") for item in all_entries if item.get("enable")]
+            if "icloud" in enabled_types:
+                ptype = "icloud"
+            elif "inbucket" in enabled_types:
+                ptype = "inbucket"
+            elif "cloudflare_temp_email" in enabled_types:
+                ptype = "cloudflare_temp_email"
+            else:
+                ptype = DEFAULT_EXISTING_MAILBOX_PROVIDER_TYPE
         candidates = [item for item in all_entries if str(item.get("type") or "") == ptype]
         if not candidates and ptype == DEFAULT_EXISTING_MAILBOX_PROVIDER_TYPE:
             # 未配置 CF 时退回已启用列表，避免完全不可用
             candidates = [item for item in all_entries if item.get("enable")]
             if not candidates:
                 raise RuntimeError(
-                    "mail.providers 未配置 cloudflare_temp_email，也没有其它启用的邮箱服务"
+                    "mail.providers 未配置可用邮箱服务（icloud / inbucket / cloudflare_temp_email）"
                 )
         elif not candidates:
             raise RuntimeError(f"未找到类型为 {ptype} 的邮箱服务")

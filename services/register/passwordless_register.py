@@ -413,5 +413,8 @@ class PasswordlessRegistrar(PlatformRegistrar):
             "account_id": str(tokens.get("account_id") or "").strip(),
             "source_type": str(tokens.get("source") or tokens.get("source_type") or "chatgpt_session"),
             "register_flow": self.FLOW_NAME,
+            "mail_provider_ref": str(mailbox.get("provider_ref") or ""),
+            "mail_provider_type": str(mailbox.get("provider") or "icloud"),
+            "mail_inbox": str(mailbox.get("inbox_address") or mailbox.get("mail_inbox") or ""),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
