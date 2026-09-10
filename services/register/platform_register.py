@@ -13,8 +13,10 @@ Flow:
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 from services.register import mail_provider
 from services.register.openai_register import (
@@ -28,12 +30,16 @@ from services.register.openai_register import (
     _response_json,
     auth_base,
     create_mailbox,
+    extract_oauth_callback_params_from_url,
+    platform_base,
     request_platform_oauth_token,
     request_with_local_retry,
     step,
     wait_for_code,
 )
 from services.register.passwordless_register import PasswordlessRegistrar
+
+_CODE_RE = re.compile(r"[?&]code=([A-Za-z0-9._\-]+)")
 
 
 class PlatformHarRegistrar(PasswordlessRegistrar):
@@ -97,10 +103,112 @@ class PlatformHarRegistrar(PasswordlessRegistrar):
         continue_url = str(data.get("continue_url") or "").strip()
         step(index, f"提交邮箱完成[platform] page={page_type or '?'} url={(continue_url or '')[:120]}")
 
+    def _take_oauth_code(self, raw: str) -> bool:
+        text = str(raw or "").strip()
+        if not text:
+            return False
+        params = extract_oauth_callback_params_from_url(text)
+        code = str((params or {}).get("code") or "").strip()
+        if not code:
+            match = _CODE_RE.search(text)
+            code = str(match.group(1) if match else "").strip()
+        if not code:
+            return False
+        self.continue_url = text if text.startswith("http") else self.continue_url
+        self.platform_auth_code = code
+        return True
+
+    def _collect_redirect_candidates(self, resp, data: dict) -> list[str]:
+        out: list[str] = []
+        if resp is not None:
+            headers = getattr(resp, "headers", {}) or {}
+            for key in ("Location", "location"):
+                try:
+                    value = str(headers.get(key) or "").strip()
+                except Exception:
+                    value = ""
+                if value:
+                    out.append(value)
+            final_url = str(getattr(resp, "url", "") or "").strip()
+            if final_url:
+                out.append(final_url)
+            for hist in getattr(resp, "history", None) or []:
+                hist_url = str(getattr(hist, "url", "") or "").strip()
+                if hist_url:
+                    out.append(hist_url)
+        if isinstance(data, dict):
+            out.append(str(data.get("continue_url") or ""))
+            page = data.get("page") if isinstance(data.get("page"), dict) else {}
+            payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
+            if isinstance(payload, dict):
+                for key in ("url", "redirect_url", "continue_url", "redirect"):
+                    out.append(str(payload.get(key) or ""))
+            for key in ("url", "redirect_url", "redirect"):
+                out.append(str(data.get(key) or ""))
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for item in out:
+            value = str(item or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            uniq.append(value)
+        return uniq
+
+    def _follow_continue_for_code(self, index: int) -> None:
+        raw = str(self.continue_url or "").strip()
+        if not raw:
+            return
+        url = raw if raw.startswith("http") else urljoin(auth_base + "/", raw.lstrip("/"))
+        if url.startswith("/"):
+            url = urljoin(platform_base + "/", url.lstrip("/"))
+        headers = self._navigate_headers(f"{auth_base}/about-you")
+        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            url,
+            headers=headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        if resp is None:
+            step(index, f"跟随 continue_url 失败: {error or 'no response'}", "yellow")
+            return
+        data = _response_json(resp)
+        for candidate in self._collect_redirect_candidates(resp, data):
+            if self._take_oauth_code(candidate):
+                step(index, f"跟随 continue_url 拿到 platform code url={candidate[:160]}")
+                return
+        raw_text = ""
+        try:
+            raw_text = str(getattr(resp, "text", "") or "")
+        except Exception:
+            raw_text = ""
+        if self._take_oauth_code(raw_text):
+            step(index, "从 continue 响应正文解析到 platform code")
+
+    def _create_account(self, name: str, birthdate: str, index: int) -> None:
+        super()._create_account(name, birthdate, index)
+        if not str(self.platform_auth_code or "").strip():
+            self._follow_continue_for_code(index)
+        step(
+            index,
+            "platform 换票材料 "
+            f"code={'yes' if self.platform_auth_code else 'no'} "
+            f"verifier={len(str(self.code_verifier or ''))} "
+            f"continue={(self.continue_url or '')[:180]}",
+        )
+
     def _exchange_platform_oauth(self, index: int) -> dict:
         step(index, "开始换 token[platform oauth]")
-        if not str(self.platform_auth_code or "").strip() or not str(self.code_verifier or "").strip():
-            raise RuntimeError("platform oauth 缺少 authorization code 或 code_verifier")
+        if not str(self.code_verifier or "").strip():
+            raise RuntimeError("platform oauth 缺少 code_verifier（authorize PKCE 丢失）")
+        if not str(self.platform_auth_code or "").strip():
+            raise RuntimeError(
+                "platform oauth 缺少 authorization code "
+                f"continue={(self.continue_url or '')[:240]!r}"
+            )
         tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
         if not tokens or not str(tokens.get("access_token") or "").strip():
             raise RuntimeError("platform oauth/token 换取失败")

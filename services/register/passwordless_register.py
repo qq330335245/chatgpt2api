@@ -8,6 +8,7 @@ is left intact and remains the default.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -367,14 +368,44 @@ class PasswordlessRegistrar(PlatformRegistrar):
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
 
         data = _response_json(resp)
-        self.continue_url = str(data.get("continue_url") or "").strip()
-        if not self.continue_url:
-            page = data.get("page") if isinstance(data.get("page"), dict) else {}
-            payload_obj = page.get("payload") if isinstance(page, dict) and isinstance(page.get("payload"), dict) else {}
-            self.continue_url = str((payload_obj or {}).get("url") or "").strip()
+        raw_text = ""
+        try:
+            raw_text = str(getattr(resp, "text", "") or "")
+        except Exception:
+            raw_text = ""
+        if not data and raw_text.strip().startswith("{"):
+            try:
+                parsed = json.loads(raw_text)
+                data = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                data = {}
+        loc = ""
+        try:
+            loc = str((getattr(resp, "headers", {}) or {}).get("Location") or (getattr(resp, "headers", {}) or {}).get("location") or "").strip()
+        except Exception:
+            loc = ""
+        page = data.get("page") if isinstance(data.get("page"), dict) else {}
+        payload_obj = page.get("payload") if isinstance(page, dict) and isinstance(page.get("payload"), dict) else {}
+        self.continue_url = str(
+            data.get("continue_url")
+            or (payload_obj or {}).get("url")
+            or loc
+            or getattr(resp, "url", "")
+            or ""
+        ).strip()
         callback_params = extract_oauth_callback_params_from_url(self.continue_url)
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
-        step(index, "填写账号资料完成[passwordless]")
+        if not self.platform_auth_code:
+            match = re.search(r"[?&]code=([A-Za-z0-9._\-]+)", "\n".join([self.continue_url, raw_text, loc]))
+            if match:
+                self.platform_auth_code = match.group(1).strip()
+        step(
+            index,
+            "填写账号资料完成[passwordless] "
+            f"keys={sorted(list(data)[:12]) if isinstance(data, dict) else []} "
+            f"code={'yes' if self.platform_auth_code else 'no'} "
+            f"continue={(self.continue_url or '')[:160]}",
+        )
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱[passwordless]")
