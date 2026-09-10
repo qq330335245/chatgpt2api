@@ -51,8 +51,8 @@ class ChatRequirements:
     raw_finalize: Optional[Dict[str, Any]] = None
 
 
-DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
-DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
+DEFAULT_CLIENT_VERSION = "prod-5646044701f5c80d0acccfa529e0f351b95e2bb8"
+DEFAULT_CLIENT_BUILD_NUMBER = "10555503"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
@@ -548,15 +548,22 @@ class OpenAIBackendAPI:
         return payload
 
     def _image_model_slug(self, model: str) -> str:
-        """把标准图片模型名映射到底层 model slug。"""
+        """把对外图片模型名映射到 chatgpt.com conversation 的 model slug。
+
+        2026-09 官网 Images / picture_v2 生图 HAR 使用 `auto`，不再走 gpt-5-3。
+        """
         _, base_model = split_image_model(model)
-        if not base_model:
-            return "auto"
-        if base_model == "gpt-image-2":
-            return "gpt-5-3"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
+
+    @staticmethod
+    def _image_model_response_contracts() -> list[Dict[str, Any]]:
+        return [{
+            "id": "photo_upload_action.v1",
+            "protocol_version": 1,
+            "presets": ["cap:image", "cap:file", "placement:end"],
+        }]
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
@@ -855,6 +862,7 @@ class OpenAIBackendAPI:
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": ["picture_v2"],
+            "model_response_contracts": self._image_model_response_contracts(),
             "partial_query": {
                 "id": new_uuid(),
                 "author": {"role": "user"},
@@ -994,6 +1002,7 @@ class OpenAIBackendAPI:
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
+            "model_response_contracts": self._image_model_response_contracts(),
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {
@@ -1021,12 +1030,25 @@ class OpenAIBackendAPI:
         return response
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
-        """获取完整 conversation 详情。"""
-        path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
-        ensure_ok(response, path)
-        return response.json()
+        """获取 conversation 详情。官网生图 HAR 用复数 /conversations/{id}。"""
+        last_error: Exception | None = None
+        for path in (
+            f"/backend-api/conversations/{conversation_id}",
+            f"/backend-api/conversation/{conversation_id}",
+        ):
+            response = self.session.get(
+                self.base_url + path,
+                headers=self._headers(path, {"Accept": "application/json"}),
+                timeout=60,
+            )
+            if response.status_code == 404:
+                last_error = UpstreamHTTPError(path, 404, response.text)
+                continue
+            ensure_ok(response, path)
+            return response.json()
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"conversation not found: {conversation_id}")
 
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """删除本地对话记录。"""
@@ -2292,13 +2314,26 @@ class OpenAIBackendAPI:
         raise exc
 
     def _get_file_download_url(self, file_id: str) -> str:
-        """获取文件下载地址。"""
-        path = f"/backend-api/files/{file_id}/download"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
-        ensure_ok(response, path)
-        data = response.json()
-        return data.get("download_url") or data.get("url") or ""
+        """获取文件下载地址。官网 HAR 使用 /files/download/{file_id}。"""
+        last_error: Exception | None = None
+        for path in (
+            f"/backend-api/files/download/{file_id}",
+            f"/backend-api/files/{file_id}/download",
+        ):
+            response = self.session.get(
+                self.base_url + path,
+                headers=self._headers(path, {"Accept": "application/json"}),
+                timeout=60,
+            )
+            if response.status_code == 404:
+                last_error = UpstreamHTTPError(path, 404, response.text)
+                continue
+            ensure_ok(response, path)
+            data = response.json()
+            return data.get("download_url") or data.get("url") or ""
+        if last_error:
+            raise last_error
+        return ""
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
@@ -2466,17 +2501,15 @@ class OpenAIBackendAPI:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
-        # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
-        # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
-        if poll and conversation_id and (file_ids or sediment_ids):
-            if not config.image_check_before_hit_enabled and not config.image_settle_enabled:
-                logger.info({
-                    "event": "image_resolve_skip_poll_direct_resolve",
-                    "conversation_id": conversation_id,
-                    "file_ids": file_ids,
-                    "sediment_ids": sediment_ids,
-                })
-                return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+        # 反代生图不需要对话：SSE 已给出 file_ids 时直接下图，不再拉 conversation 文档。
+        if conversation_id and (file_ids or sediment_ids):
+            logger.info({
+                "event": "image_resolve_skip_conversation_poll",
+                "conversation_id": conversation_id,
+                "file_ids": file_ids,
+                "sediment_ids": sediment_ids,
+            })
+            return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
         if poll and conversation_id:
             logger.info({
                 "event": "image_resolve_poll_needed",
