@@ -334,7 +334,7 @@ type SettingsStore = {
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterMode: (value: "total" | "quota" | "available") => void;
-  setRegisterFlow: (value: "legacy" | "passwordless") => void;
+  setRegisterFlow: (value: "legacy" | "passwordless" | "platform") => void;
   setRegisterTargetQuota: (value: string) => void;
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
@@ -1006,7 +1006,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         total: Math.max(1, Number(registerConfig.total) || 1),
         threads: Math.max(1, Number(registerConfig.threads) || 1),
         mode: registerConfig.mode,
-        register_flow: registerConfig.register_flow === "passwordless" ? "passwordless" : "legacy",
+        register_flow: registerConfig.register_flow === "platform" || registerConfig.register_flow === "passwordless" ? registerConfig.register_flow : "legacy",
         target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
         check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
@@ -1032,7 +1032,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           total: Math.max(1, Number(registerConfig.total) || 1),
           threads: Math.max(1, Number(registerConfig.threads) || 1),
           mode: registerConfig.mode,
-          register_flow: registerConfig.register_flow === "passwordless" ? "passwordless" : "legacy",
+          register_flow: registerConfig.register_flow === "platform" || registerConfig.register_flow === "passwordless" ? registerConfig.register_flow : "legacy",
           target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),
           check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),

@@ -584,7 +584,7 @@ class PlatformRegistrar:
         self.code_verifier = ""
         step(index, f"官网入口完成[{result.page_type or '?'}]")
 
-    def _platform_authorize(self, email: str, index: int) -> None:
+    def _platform_authorize(self, email: str, index: int, *, login_hint: bool = True) -> None:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
@@ -600,7 +600,6 @@ class PlatformRegistrar:
             # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
             "screen_hint": "signup",
             "max_age": "0",
-            "login_hint": email,
             "scope": "openid profile email offline_access",
             "response_type": "code",
             "response_mode": "query",
@@ -610,6 +609,9 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
+        # HAR 对齐：邮箱在 authorize/continue 提交，authorize 本身不带 login_hint。
+        if login_hint:
+            params["login_hint"] = email
         target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
         headers = self._navigate_headers(f"{platform_base}/")
         headers = _headers_with_clearance(headers, target_url, self.proxy, self.clearance_user_agent)
@@ -813,6 +815,8 @@ class PlatformRegistrar:
 
 def _resolve_register_flow() -> str:
     flow = str(config.get("register_flow") or "legacy").strip().lower()
+    if flow in {"platform", "platform_signup", "platform_oauth"}:
+        return "platform"
     if flow in {"passwordless", "passwordless_signup", "official", "new"}:
         return "passwordless"
     return "legacy"
@@ -821,7 +825,12 @@ def _resolve_register_flow() -> str:
 def worker(index: int) -> dict:
     start = time.time()
     flow = _resolve_register_flow()
-    if flow == "passwordless":
+    if flow == "platform":
+        from services.register.platform_register import PlatformHarRegistrar
+
+        registrar = PlatformHarRegistrar(config["proxy"])
+        flow_label = "platform"
+    elif flow == "passwordless":
         from services.register.passwordless_register import PasswordlessRegistrar
 
         registrar = PasswordlessRegistrar(config["proxy"])

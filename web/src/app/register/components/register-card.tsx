@@ -113,8 +113,8 @@ export function RegisterCard() {
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册流程</label>
               <Select
-                value={config.register_flow === "passwordless" ? "passwordless" : "legacy"}
-                onValueChange={(value) => setRegisterFlow(value as "legacy" | "passwordless")}
+                value={config.register_flow === "platform" ? "platform" : config.register_flow === "passwordless" ? "passwordless" : "legacy"}
+                onValueChange={(value) => setRegisterFlow(value as "legacy" | "passwordless" | "platform")}
                 disabled={config.enabled}
               >
                 <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
@@ -122,11 +122,12 @@ export function RegisterCard() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="legacy">旧流程（设密码 + OTP）</SelectItem>
-                  <SelectItem value="passwordless">新流程（Passwordless 官网路径）</SelectItem>
+                  <SelectItem value="passwordless">新流程（Passwordless chatgpt.com）</SelectItem>
+                  <SelectItem value="platform">Platform（PKCE + OTP，换 AT/RT）</SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-xs leading-5 text-stone-500">
-                新流程对齐最新官网 HAR：login_or_signup → 邮箱 OTP → about-you，并携带 sentinel SO token。
+                Platform 对齐 platform.openai.com HAR：authorize → continue 提交邮箱 → OTP → create_account → oauth/token。
               </p>
             </div>
             <div className="space-y-2">

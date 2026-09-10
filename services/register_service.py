@@ -43,7 +43,7 @@ def _default_config() -> dict:
         "target_quota": 100,
         "target_available": 10,
         "check_interval": 5,
-        # register_flow: legacy (password path) | passwordless (official HAR path)
+        # register_flow: legacy | passwordless | platform
         "register_flow": "legacy",
         "enabled": False,
         "stats": {
@@ -85,7 +85,12 @@ def _normalize(raw: dict) -> dict:
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     flow = str(cfg.get("register_flow") or "legacy").strip().lower()
-    cfg["register_flow"] = "passwordless" if flow in {"passwordless", "passwordless_signup", "official", "new"} else "legacy"
+    if flow in {"platform", "platform_signup", "platform_oauth"}:
+        cfg["register_flow"] = "platform"
+    elif flow in {"passwordless", "passwordless_signup", "official", "new"}:
+        cfg["register_flow"] = "passwordless"
+    else:
+        cfg["register_flow"] = "legacy"
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
     mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
     cfg["mail"] = {**default_mail, **mail}
