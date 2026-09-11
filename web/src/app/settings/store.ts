@@ -173,6 +173,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     };
   return {
     ...config,
+    refresh_account_enabled: Boolean(config.refresh_account_enabled),
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     image_retention_days: Number(config.image_retention_days || 30),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
@@ -299,6 +300,7 @@ type SettingsStore = {
   runBackup: () => Promise<void>;
   removeBackup: (key: string) => Promise<void>;
   testBackup: () => Promise<void>;
+  setRefreshAccountEnabled: (value: boolean) => void;
   setRefreshAccountIntervalMinute: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
@@ -449,6 +451,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       const data = await updateSettingsConfig({
         ...config,
+        refresh_account_enabled: Boolean(config.refresh_account_enabled),
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
@@ -532,6 +535,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     } finally {
       set({ isSavingConfig: false });
     }
+  },
+
+  setRefreshAccountEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, refresh_account_enabled: value } } : {});
   },
 
   setRefreshAccountIntervalMinute: (value) => {

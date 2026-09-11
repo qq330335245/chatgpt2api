@@ -447,6 +447,13 @@ class ConfigStore:
         return DATA_DIR / "accounts.json"
 
     @property
+    def refresh_account_enabled(self) -> bool:
+        value = self.data.get("refresh_account_enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
     def refresh_account_interval_minute(self) -> int:
         try:
             return int(self.data.get("refresh_account_interval_minute", 5))
@@ -625,6 +632,7 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data["refresh_account_enabled"] = self.refresh_account_enabled
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs

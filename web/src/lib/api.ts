@@ -179,6 +179,7 @@ export type SettingsConfig = {
     model?: string;
     prompt?: string;
   };
+  refresh_account_enabled?: boolean;
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;

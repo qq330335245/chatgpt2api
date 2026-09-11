@@ -22,6 +22,7 @@ export function ConfigCard() {
   const config = useSettingsStore((state) => state.config);
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
+  const setRefreshAccountEnabled = useSettingsStore((state) => state.setRefreshAccountEnabled);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
@@ -87,15 +88,26 @@ export function ConfigCard() {
           管理员登录密钥继续从部署配置读取，不再在此页面展示；如需分发给其他人，请在下方创建普通用户密钥。
         </div>
         <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2 md:col-span-2">
+            <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+              <Checkbox
+                checked={Boolean(config?.refresh_account_enabled)}
+                onCheckedChange={(checked) => setRefreshAccountEnabled(Boolean(checked))}
+              />
+              后台账号巡检
+            </label>
+            <p className="text-xs text-stone-500">默认关闭。开启后才会定时用 AT 请求 chatgpt.com 检查号是否有效、刷新额度；关闭后只在手动刷新或生图时才会打官方。</p>
+          </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">账号刷新间隔</label>
             <Input
               value={String(config?.refresh_account_interval_minute || "")}
               onChange={(event) => setRefreshAccountIntervalMinute(event.target.value)}
               placeholder="分钟"
-              className="h-10 rounded-xl border-stone-200 bg-white"
+              className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!config?.refresh_account_enabled}
             />
-            <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
+            <p className="text-xs text-stone-500">单位分钟，仅在开启后台巡检后生效。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">全局代理</label>
