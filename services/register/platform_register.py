@@ -16,9 +16,10 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from services.register import mail_provider
+from services.register.chatgpt_web_entry import fetch_chatgpt_web_session
 from services.register.openai_register import (
     _cloudflare_block_message,
     _headers_with_clearance,
@@ -35,6 +36,7 @@ from services.register.openai_register import (
     request_platform_oauth_token,
     request_with_local_retry,
     step,
+    user_agent,
     wait_for_code,
 )
 from services.register.passwordless_register import PasswordlessRegistrar
@@ -44,6 +46,35 @@ _CODE_RE = re.compile(r"[?&]code=([A-Za-z0-9._\-]+)")
 
 class PlatformHarRegistrar(PasswordlessRegistrar):
     FLOW_NAME = "platform"
+
+    def _json_headers(self, referer: str) -> dict[str, str]:
+        headers = super()._json_headers(referer)
+        headers.pop("oai-device-id", None)
+        headers.pop("dnt", None)
+        headers.pop("sec-gpc", None)
+        for key in list(headers):
+            if key.startswith("trace") or key.startswith("x-datadog"):
+                headers.pop(key, None)
+        return headers
+
+    def _visit_auth_page(self, path: str, referer: str, index: int) -> None:
+        url = path if str(path).startswith("http") else f"{auth_base}{path}"
+        headers = self._navigate_headers(referer)
+        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            url,
+            headers=headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        final = str(getattr(resp, "url", "") or url)[:160] if resp is not None else url
+        if resp is None or int(status or 0) >= 400:
+            step(index, f"打开 {urlparse(url).path or url} 失败 status={status} {error or ''}", "yellow")
+            return
+        step(index, f"打开页面 {urlparse(final).path or urlparse(url).path} HTTP {status}")
 
     def _authorize_continue_email(self, email: str, index: int) -> None:
         step(index, "开始提交邮箱[platform continue]")
@@ -102,6 +133,7 @@ class PlatformHarRegistrar(PasswordlessRegistrar):
         page_type = str((page or {}).get("type") or "").strip()
         continue_url = str(data.get("continue_url") or "").strip()
         step(index, f"提交邮箱完成[platform] page={page_type or '?'} url={(continue_url or '')[:120]}")
+        self._visit_auth_page("/email-verification", f"{auth_base}/create-account", index)
 
     def _take_oauth_code(self, raw: str) -> bool:
         text = str(raw or "").strip()
@@ -225,6 +257,39 @@ class PlatformHarRegistrar(PasswordlessRegistrar):
             "expires_in": tokens.get("expires_in"),
         }
 
+    def _merge_chatgpt_web_session(self, index: int, tokens: dict) -> dict:
+        """create_account 会种 unified_session cookie；HAR 随后 GET platform callback。
+        再读 chatgpt.com/api/auth/session，尽量拿到网页 AT 供巡检/生图。"""
+        callback = str(self.continue_url or "").strip()
+        if not callback and self.platform_auth_code:
+            callback = f"{platform_base}/auth/callback?code={self.platform_auth_code}"
+        try:
+            web = fetch_chatgpt_web_session(
+                self.session,
+                continue_url=callback,
+                user_agent=self.clearance_user_agent or user_agent,
+            )
+        except Exception as exc:
+            step(index, f"chatgpt session 交换失败: {exc}", "yellow")
+            return tokens
+        if not web.get("ok") and not web.get("access_token"):
+            step(index, f"chatgpt session 未返回 AT: {str(web.get('error') or '')[:160]}", "yellow")
+            return tokens
+        web_at = str(web.get("access_token") or "").strip()
+        if not web_at:
+            return tokens
+        merged = dict(tokens)
+        merged["access_token"] = web_at
+        merged["session_token"] = str(web.get("session_token") or "").strip()
+        merged["account_id"] = str(web.get("account_id") or merged.get("account_id") or "").strip()
+        if web.get("email"):
+            merged["email"] = str(web.get("email") or "").strip()
+        if not merged.get("id_token") and web.get("id_token"):
+            merged["id_token"] = str(web.get("id_token") or "").strip()
+        merged["source"] = "chatgpt_session"
+        step(index, "已附加 chatgpt.com session AT（保留 platform RT）")
+        return merged
+
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱[platform]")
         mailbox = create_mailbox(register_proxy=self.proxy)
@@ -246,8 +311,10 @@ class PlatformHarRegistrar(PasswordlessRegistrar):
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
             self._validate_otp(code, index)
+            self._visit_auth_page("/about-you", f"{auth_base}/email-verification", index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
             tokens = self._exchange_platform_oauth(index)
+            tokens = self._merge_chatgpt_web_session(index, tokens)
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise

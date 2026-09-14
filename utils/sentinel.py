@@ -50,7 +50,7 @@ class SentinelTokenGenerator:
             4294705152,
             random.random(),
             self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
+            "https://sentinel.openai.com/sentinel/20260810913b/sdk.js",
             None,
             None,
             "en-US",

@@ -8,8 +8,8 @@ const vm = require("vm");
 const crypto = require("crypto");
 const { TextEncoder } = require("util");
 
-const SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
-const FRAME_URL = "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6";
+const SDK_URL = "https://sentinel.openai.com/sentinel/20260810913b/sdk.js";
+const FRAME_URL = "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260810913b";
 
 function parseArgs(argv) {
   const result = {
@@ -24,9 +24,9 @@ function parseArgs(argv) {
     out: "",
     pageUrl: "",
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    language: "en-US",
-    languages: "en-US,en",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+    language: "zh-CN",
+    languages: "zh-CN,zh",
     screenWidth: 1920,
     screenHeight: 1080,
     screenAvailHeight: 0,

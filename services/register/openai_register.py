@@ -66,10 +66,10 @@ chatgpt_oauth_client_id = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
+    "Chrome/152.0.0.0 Safari/537.36"
 )
-sec_ch_ua = '"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"'
-sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0"'
+sec_ch_ua = '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"'
+sec_ch_ua_full_version_list = '"Chromium";v="152.0.0.0", "Not?A_Brand";v="24.0.0.0", "Google Chrome";v="152.0.0.0"'
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
@@ -79,14 +79,12 @@ register_log_sink = None
 common_headers = {
     "accept": "application/json",
     "accept-encoding": "gzip, deflate, br",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": "zh-CN,zh;q=0.9",
     "cache-control": "no-cache",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "dnt": "1",
     "origin": auth_base,
     "priority": "u=1, i",
-    "sec-gpc": "1",
     "sec-ch-ua": sec_ch_ua,
     "sec-ch-ua-arch": '"x86_64"',
     "sec-ch-ua-bitness": '"64"',
@@ -104,11 +102,9 @@ common_headers = {
 navigate_headers = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "accept-encoding": "gzip, deflate, br",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": "zh-CN,zh;q=0.9",
     "cache-control": "max-age=0",
     "connection": "keep-alive",
-    "dnt": "1",
-    "sec-gpc": "1",
     "sec-ch-ua": sec_ch_ua,
     "sec-ch-ua-arch": '"x86_64"',
     "sec-ch-ua-bitness": '"64"',
