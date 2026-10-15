@@ -1057,13 +1057,29 @@ class OpenAIBackendAPI:
             "client_prepare_state": "success",
         }
         path = "/backend-api/f/conversation"
+        headers = self._image_headers(path, requirements, conduit_token, "text/event-stream")
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            headers=headers,
             json=payload,
             timeout=300,
             stream=True,
         )
+        if response.status_code >= 400:
+            logger.warning({
+                "event": "image_conversation_http_failure",
+                "status": response.status_code,
+                "content_type": response.headers.get("content-type", ""),
+                "server": response.headers.get("server", ""),
+                "cf_ray_region": str(response.headers.get("cf-ray", "")).rsplit("-", 1)[-1][:10],
+                "request_id": response.headers.get("x-oai-request-id", ""),
+                "account_id_header": bool(headers.get("chatgpt-account-id")),
+                "turnstile_header": bool(headers.get("OpenAI-Sentinel-Turnstile-Token")),
+                "proof_header": bool(headers.get("OpenAI-Sentinel-Proof-Token")),
+                "requirements_header": bool(headers.get("OpenAI-Sentinel-Chat-Requirements-Token")),
+                "conduit_header": bool(headers.get("X-Conduit-Token")),
+                "cookie_names": sorted(str(name) for name in self.session.cookies),
+            })
         ensure_ok(response, path)
         return response
 
@@ -2719,8 +2735,14 @@ class OpenAIBackendAPI:
 
         turnstile_token = ""
         turnstile_info = prepare_data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+        if turnstile_info.get("required"):
+            if turnstile_info.get("dx"):
+                turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+            if not turnstile_token:
+                raise RuntimeError(
+                    "Sentinel turnstile 必需，但现有解题器不支持本次 dx；"
+                    "不能用空 token 继续生图（否则 /f/conversation 返回 404）。"
+                )
 
         finalize_path = base + "/finalize"
         response = self.session.post(
@@ -2728,8 +2750,8 @@ class OpenAIBackendAPI:
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
                 "prepare_token": prepare_data.get("prepare_token", ""),
-                "proof_token": proof_token,
-                "turnstile_token": turnstile_token,
+                "proofofwork": proof_token,
+                "turnstile": turnstile_token,
             },
             timeout=30,
         )

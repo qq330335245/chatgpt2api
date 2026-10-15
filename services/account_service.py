@@ -170,10 +170,25 @@ class AccountService:
         self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
+    def _is_platform_api_only_token(account: dict) -> bool:
+        """Platform 注册的 API bearer 可通过 /me，但不能调用网页生图路由。"""
+        payload = AccountService._decode_jwt_payload(str(account.get("access_token") or ""))
+        # The Platform SPA app issues API-audience bearer tokens. An account
+        # mistakenly imported as "web" is still incompatible with conversation.
+        if payload.get("client_id") == "app_2SKx67EdpoN0G6j64rFvigXD":
+            return True
+        if str(account.get("source_type") or "").strip().lower() != "platform_oauth":
+            return False
+        auth = payload.get("https://api.openai.com/auth")
+        return not (isinstance(auth, dict) and auth.get("chatgpt_account_id"))
+
+    @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
+            return False
+        if AccountService._is_platform_api_only_token(account):
             return False
         return int(account.get("quota") or 0) > 0
 
@@ -3017,6 +3032,22 @@ class AccountService:
         with self._image_slot_condition:
             while True:
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                    # /me and quota can succeed for a Platform API token while
+                    # /f/conversation returns an empty-body 404. Do not retry it.
+                    active = [
+                        item for item in self._accounts.values()
+                        if item.get("status") not in {"禁用", "限流", "异常"}
+                        and int(item.get("quota") or 0) > 0
+                        and self._account_matches_plan_type(item, plan_type)
+                        and self._account_matches_any_plan_type(item, plan_types)
+                        and self._account_matches_source_type(item, source_type)
+                        and item.get("access_token") not in (excluded_tokens or set())
+                    ]
+                    if active and all(self._is_platform_api_only_token(item) for item in active):
+                        raise RuntimeError(
+                            "当前账号池只有 Platform OAuth API token；它虽能查询 /backend-api/me，"
+                            "但不能用于 chatgpt.com 网页生图。请导入 ChatGPT 网页会话 access_token。"
+                        )
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
