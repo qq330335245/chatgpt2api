@@ -3045,8 +3045,8 @@ class AccountService:
                     ]
                     if active and all(self._is_platform_api_only_token(item) for item in active):
                         raise RuntimeError(
-                            "当前账号池只有 Platform OAuth API token；它虽能查询 /backend-api/me，"
-                            "但不能用于 chatgpt.com 网页生图。请导入 ChatGPT 网页会话 access_token。"
+                            "当前账号池只有 Platform OAuth API token：可查询账户信息，但不能用于网页生图。"
+                            "请导入 ChatGPT 网页会话 access_token。"
                         )
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
