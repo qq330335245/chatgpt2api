@@ -577,6 +577,13 @@ class OpenAIBackendAPI:
             "x-openai-codex-window-type": "browser",
             "x-openai-web-frontend": "codex_webview",
             "x-oai-mcp-form-version": "2",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+            ),
+            "sec-ch-ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         }
         if requirements.token:
             headers["OpenAI-Sentinel-Chat-Requirements-Token"] = requirements.token
@@ -586,12 +593,44 @@ class OpenAIBackendAPI:
             headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
-        if accept == "text/event-stream":
-            headers["X-Oai-Turn-Trace-Id"] = new_uuid()
+        account_id = self._chatgpt_account_id()
+        if account_id:
+            headers["chatgpt-account-id"] = account_id
+        trace_id = str(getattr(self, "_image_turn_trace_id", "") or "").strip()
+        if accept == "text/event-stream" or trace_id:
+            headers["X-Oai-Turn-Trace-Id"] = trace_id or new_uuid()
         built = self._headers(path, headers)
-        built.pop("X-OpenAI-Target-Path", None)
-        built.pop("X-OpenAI-Target-Route", None)
+        for stale in (
+            "X-OpenAI-Target-Path",
+            "X-OpenAI-Target-Route",
+            "OAI-Client-Version",
+            "OAI-Client-Build-Number",
+            "Sec-Ch-Ua-Full-Version",
+            "Sec-Ch-Ua-Full-Version-List",
+        ):
+            built.pop(stale, None)
         return built
+
+    def _chatgpt_account_id(self) -> str:
+        """10.15 生图 HAR 用请求头 chatgpt-account-id。没有它时 /f/conversation 直接 404。"""
+        cached = str(getattr(self, "_cached_chatgpt_account_id", "") or "").strip()
+        if cached:
+            return cached
+        payload = account_service._decode_jwt_payload(self.access_token)
+        auth = payload.get("https://api.openai.com/auth")
+        account_id = ""
+        if isinstance(auth, dict):
+            account_id = str(auth.get("chatgpt_account_id") or "").strip()
+        if not account_id:
+            account_id = str(payload.get("chatgpt_account_id") or "").strip()
+        if not account_id and self.access_token:
+            try:
+                account_id = str(self._get_default_account().get("account_id") or "").strip()
+            except Exception:
+                account_id = ""
+        if account_id:
+            self._cached_chatgpt_account_id = account_id
+        return account_id
 
     def _codex_responses_headers(self) -> Dict[str, str]:
         return {
@@ -864,6 +903,7 @@ class OpenAIBackendAPI:
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
+        self._image_turn_trace_id = new_uuid()
         payload = {
             "client_prepare_state": "sent",
             "action": "next",
