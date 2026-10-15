@@ -567,19 +567,31 @@ class OpenAIBackendAPI:
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
-        """构造图片链路请求头。"""
+        """2026-10 Codex webview 生图头。prepare 不带 sentinel；conversation 才带。"""
         headers = {
             "Content-Type": "application/json",
             "Accept": accept,
-            "OpenAI-Sentinel-Chat-Requirements-Token": requirements.token,
+            "oai-did": self.device_id,
+            "oai-language": "zh-CN",
+            "originator": "Codex Browser",
+            "x-openai-codex-window-type": "browser",
+            "x-openai-web-frontend": "codex_webview",
+            "x-oai-mcp-form-version": "2",
         }
+        if requirements.token:
+            headers["OpenAI-Sentinel-Chat-Requirements-Token"] = requirements.token
         if requirements.proof_token:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+        if getattr(requirements, "turnstile_token", ""):
+            headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
         if accept == "text/event-stream":
             headers["X-Oai-Turn-Trace-Id"] = new_uuid()
-        return self._headers(path, headers)
+        built = self._headers(path, headers)
+        built.pop("X-OpenAI-Target-Path", None)
+        built.pop("X-OpenAI-Target-Route", None)
+        return built
 
     def _codex_responses_headers(self) -> Dict[str, str]:
         return {
@@ -853,28 +865,20 @@ class OpenAIBackendAPI:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
         payload = {
+            "client_prepare_state": "sent",
             "action": "next",
-            "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "is_do_not_remember": False,
             "model": self._image_model_slug(model),
-            "client_prepare_state": "success",
-            "timezone_offset_min": -480,
+            "parent_message_id": "client-created-root",
             "timezone": "Asia/Shanghai",
-            "conversation_mode": {"kind": "primary_assistant"},
-            "system_hints": ["picture_v2"],
-            "model_response_contracts": self._image_model_response_contracts(),
-            "partial_query": {
-                "id": new_uuid(),
-                "author": {"role": "user"},
-                "content": {"content_type": "text", "parts": [prompt]},
-            },
-            "supports_buffering": True,
-            "supported_encodings": ["v1"],
-            "client_contextual_info": {"app_name": "chatgpt.com"},
+            "timezone_offset_min": -480,
+            "local_function_names": ["local.continue_in_work"],
+            "client_prepare_dispatch": "debounced",
+            "client_prepare_source": "composer_editor_state",
         }
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements),
+            headers=self._image_headers(path, ChatRequirements(token="")),
             json=payload,
             timeout=60,
         )
@@ -969,13 +973,7 @@ class OpenAIBackendAPI:
         parts.append(prompt)
         content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
                                                                                           "parts": [prompt]}
-        metadata = {
-            "developer_mode_connector_ids": [],
-            "selected_github_repos": [],
-            "selected_all_github_repos": False,
-            "system_hints": ["picture_v2"],
-            "serialization_metadata": {"custom_symbol_offsets": []},
-        }
+        metadata: Dict[str, Any] = {"system_hints": ["picture_v2"]}
         if references:
             metadata["attachments"] = [{
                 "id": item["file_id"],
@@ -986,37 +984,37 @@ class OpenAIBackendAPI:
                 "height": item["height"],
             } for item in references]
         payload = {
+            "turn_attribution": {"turn_trigger": "composer"},
             "action": "next",
-            "messages": [{
-                "id": new_uuid(),
-                "author": {"role": "user"},
-                "create_time": time.time(),
-                "content": content,
-                "metadata": metadata,
-            }],
-            "parent_message_id": new_uuid(),
+            "is_do_not_remember": False,
             "model": self._image_model_slug(model),
-            "client_prepare_state": "sent",
-            "timezone_offset_min": -480,
+            "parent_message_id": "client-created-root",
             "timezone": "Asia/Shanghai",
-            "conversation_mode": {"kind": "primary_assistant"},
-            "enable_message_followups": True,
-            "system_hints": ["picture_v2"],
-            "model_response_contracts": self._image_model_response_contracts(),
-            "supports_buffering": True,
-            "supported_encodings": ["v1"],
+            "timezone_offset_min": -480,
             "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 1200,
-                "page_height": 1072,
-                "page_width": 1724,
-                "pixel_ratio": 1.2,
-                "screen_height": 1440,
-                "screen_width": 2560,
                 "app_name": "chatgpt.com",
+                "app_surface": "codex_browser",
+                "has_web_push_capabilities": True,
+                "web_push_notification_permission": "granted",
             },
-            "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "auto",
+            "local_function_names": ["local.continue_in_work"],
+            "messages": [{
+                "author": {"metadata": {}, "name": None, "role": "user"},
+                "channel": None,
+                "content": content,
+                "create_time": time.time(),
+                "end_turn": None,
+                "id": new_uuid(),
+                "metadata": metadata,
+                "recipient": "all",
+                "status": "finished_successfully",
+                "update_time": None,
+                "weight": 1,
+            }],
+            "supported_encodings": ["v1"],
+            "browser_context": {"instance_id": new_uuid()},
+            "genui_state_snapshots": [],
+            "client_prepare_state": "success",
         }
         path = "/backend-api/f/conversation"
         response = self.session.post(
